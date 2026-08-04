@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/drone/autoscaler"
 	"github.com/drone/autoscaler/drivers/internal/userdata"
@@ -42,6 +43,15 @@ func TestDefaults(t *testing.T) {
 	}
 	if got, want := p.size, "n1-standard-1"; got != want {
 		t.Errorf("Want size %q, got %q", want, got)
+	}
+	if p.sizesAlt != nil {
+		t.Errorf("Want no fallback machine types by default, got %q", p.sizesAlt)
+	}
+	if got, want := p.sizes(), []string{"n1-standard-1"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Want sizes %q with no alt configured, got %q", want, got)
+	}
+	if got, want := p.sizeCooldown, 10*time.Minute; got != want {
+		t.Errorf("Want default sizeCooldown %s, got %s", want, got)
 	}
 	if !reflect.DeepEqual(p.tags, defaultTags) {
 		t.Errorf("Want default tags")
