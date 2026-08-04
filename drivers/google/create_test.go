@@ -318,10 +318,6 @@ func stockoutResponse() map[string]interface{} {
 	}
 }
 
-// TestCreateWithZoneFallback verifies that a stockout is retried against
-// every configured zone before falling back to a different machine type,
-// mirroring the amazon driver iterating all subnets before trying sizeAlt
-// (drivers/amazon/create.go:27-69).
 func TestCreateWithZoneFallback(t *testing.T) {
 	defer gock.Off()
 
@@ -470,10 +466,6 @@ func TestCreateWithAllMachineTypesExhausted(t *testing.T) {
 	}
 }
 
-// TestCreateFallsBackOnAnyError verifies that, like the amazon driver's
-// subnet loop, a candidate is abandoned for the next one regardless of the
-// error's cause - not only on a stockout - since the amazon driver does not
-// discriminate by error type either (amazon/create.go:38-48).
 func TestCreateFallsBackOnAnyError(t *testing.T) {
 	defer gock.Off()
 

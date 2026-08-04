@@ -33,15 +33,9 @@ func isTransientError(err error) bool {
 	return false
 }
 
-// isStockoutError reports whether err indicates the requested machine type
-// has no capacity available in the zone, i.e. a candidate for falling back
-// to the next configured machine type rather than failing outright. Google
-// surfaces this two different ways depending on whether the failure is
-// synchronous (Instances.Insert) or async (a zone operation error):
-//   - a *googleapi.Error with an Errors[].Reason of
-//     "ZONE_RESOURCE_POOL_EXHAUSTED"/"ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS",
-//   - an *operationError with a Code of the same form, or a Message
-//     containing "STOCKOUT" (e.g. "state:STOCKOUT, sub-state:STOCKOUT").
+// isStockoutError reports whether err is a zone capacity failure. Google
+// returns this as a *googleapi.Error Reason on a synchronous Insert failure,
+// or as an *operationError Code/Message on an async operation failure.
 func isStockoutError(err error) bool {
 	switch e := err.(type) {
 	case *operationError:

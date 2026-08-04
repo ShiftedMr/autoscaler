@@ -22,10 +22,9 @@ import (
 func (p *provider) Create(ctx context.Context, opts autoscaler.InstanceCreateOpts) (*autoscaler.Instance, error) {
 	err := errors.New("no machine types or zones configured")
 
-	// tryAllZones attempts to create an instance of size in every configured
-	// zone (in random order), mirroring the amazon driver's tryCreateInAllSubnets:
-	// every zone is tried regardless of the error a previous zone returned,
-	// and only a successfully provisioned instance short-circuits the loop.
+	// tryAllZones attempts size in every configured zone (random order),
+	// continuing past non-stockout errors too, and only records a cooldown
+	// when the failure was actually a stockout.
 	tryAllZones := func(size string) (*autoscaler.Instance, error) {
 		var instance *autoscaler.Instance
 		var err error

@@ -66,18 +66,14 @@ func WithMachineType(size string) Option {
 	}
 }
 
-// WithMachineTypeAlt returns an option to set fallback instance types to
-// attempt, in order, if the primary machine type (and any earlier fallback)
-// fails with a capacity/stockout error.
+// WithMachineTypeAlt returns an option to set fallback instance types.
 func WithMachineTypeAlt(sizes []string) Option {
 	return func(p *provider) {
 		p.sizesAlt = sizes
 	}
 }
 
-// WithMachineTypeCooldown returns an option to set how long a machine type
-// that failed with a stockout error is skipped, per zone, before being
-// retried.
+// WithMachineTypeCooldown returns an option to set the stockout cooldown.
 func WithMachineTypeCooldown(cooldown time.Duration) Option {
 	return func(p *provider) {
 		p.sizeCooldown = cooldown

@@ -135,9 +135,8 @@ func New(opts ...Option) (autoscaler.Provider, error) {
 	return p, nil
 }
 
-// operationError preserves the structured error fields Google returns on a
-// failed async operation (e.g. Code "ZONE_RESOURCE_POOL_EXHAUSTED"), rather
-// than collapsing them to a plain string.
+// operationError preserves Google's structured Code/Message operation-error
+// fields instead of collapsing them to a plain string.
 type operationError struct {
 	Code    string
 	Message string
@@ -147,23 +146,20 @@ func (e *operationError) Error() string {
 	return e.Message
 }
 
-// sizes returns the ordered list of machine types to attempt: the primary
-// machine type followed by any configured fallbacks.
 func (p *provider) sizes() []string {
 	return append([]string{p.size}, p.sizesAlt...)
 }
 
-// sizeZoneKey identifies a (zone, machine type) pair, since a stockout is a
-// property of a specific zone, not of the machine type globally.
+// sizeZoneKey scopes cooldown state to a specific zone, since a stockout is
+// a property of a (zone, machine type) pair, not of the machine type alone.
 type sizeZoneKey struct {
 	zone string
 	size string
 }
 
-// availableZones returns the configured zones, in random order, for the
-// given machine type, with any zone currently cooling down for that type
-// filtered out. If every zone is cooling down, cooldowns are ignored and the
-// full list is returned so Create is never left with no candidates.
+// availableZones returns p.zones in random order with any zone currently
+// cooling down for size filtered out. If every zone is cooling down, the
+// cooldown is ignored and the full list is returned instead.
 func (p *provider) availableZones(size string) []string {
 	zones := make([]string, len(p.zones))
 	copy(zones, p.zones)
@@ -189,9 +185,6 @@ func (p *provider) availableZones(size string) []string {
 	return available
 }
 
-// markSizeFailed records that size failed with a stockout error in zone at
-// the current time, so that (zone, size) pair is skipped by availableZones
-// until the cooldown elapses.
 func (p *provider) markSizeFailed(zone, size string) {
 	p.sizeMu.Lock()
 	defer p.sizeMu.Unlock()
