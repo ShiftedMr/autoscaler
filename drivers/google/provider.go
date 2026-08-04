@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"sync"
 	"text/template"
@@ -51,12 +52,17 @@ type provider struct {
 	scopes              []string
 	serviceAccountEmail string
 	size                string
+	sizesAlt            []string
 	tags                []string
 	zones               []string
 	userdata            *template.Template
 	userdataKey         string
 
 	rateLimiter *rate.Limiter
+
+	sizeCooldown time.Duration
+	sizeMu       sync.Mutex
+	sizeFailures map[sizeZoneKey]time.Time
 
 	service *compute.Service
 }
@@ -78,6 +84,12 @@ func New(opts ...Option) (autoscaler.Provider, error) {
 	}
 	if p.size == "" {
 		p.size = "n1-standard-1"
+	}
+	if p.sizeCooldown == 0 {
+		p.sizeCooldown = 10 * time.Minute
+	}
+	if p.sizeFailures == nil {
+		p.sizeFailures = map[sizeZoneKey]time.Time{}
 	}
 	if p.image == "" {
 		p.image = "ubuntu-os-cloud/global/images/ubuntu-2004-focal-v20220712"
@@ -123,6 +135,69 @@ func New(opts ...Option) (autoscaler.Provider, error) {
 	return p, nil
 }
 
+// operationError preserves the structured error fields Google returns on a
+// failed async operation (e.g. Code "ZONE_RESOURCE_POOL_EXHAUSTED"), rather
+// than collapsing them to a plain string.
+type operationError struct {
+	Code    string
+	Message string
+}
+
+func (e *operationError) Error() string {
+	return e.Message
+}
+
+// sizes returns the ordered list of machine types to attempt: the primary
+// machine type followed by any configured fallbacks.
+func (p *provider) sizes() []string {
+	return append([]string{p.size}, p.sizesAlt...)
+}
+
+// sizeZoneKey identifies a (zone, machine type) pair, since a stockout is a
+// property of a specific zone, not of the machine type globally.
+type sizeZoneKey struct {
+	zone string
+	size string
+}
+
+// availableZones returns the configured zones, in random order, for the
+// given machine type, with any zone currently cooling down for that type
+// filtered out. If every zone is cooling down, cooldowns are ignored and the
+// full list is returned so Create is never left with no candidates.
+func (p *provider) availableZones(size string) []string {
+	zones := make([]string, len(p.zones))
+	copy(zones, p.zones)
+	rand.Shuffle(len(zones), func(i, j int) {
+		zones[i], zones[j] = zones[j], zones[i]
+	})
+
+	p.sizeMu.Lock()
+	defer p.sizeMu.Unlock()
+
+	now := time.Now()
+	available := make([]string, 0, len(zones))
+	for _, zone := range zones {
+		key := sizeZoneKey{zone: zone, size: size}
+		if failedAt, ok := p.sizeFailures[key]; ok && now.Sub(failedAt) < p.sizeCooldown {
+			continue
+		}
+		available = append(available, zone)
+	}
+	if len(available) == 0 {
+		return zones
+	}
+	return available
+}
+
+// markSizeFailed records that size failed with a stockout error in zone at
+// the current time, so that (zone, size) pair is skipped by availableZones
+// until the cooldown elapses.
+func (p *provider) markSizeFailed(zone, size string) {
+	p.sizeMu.Lock()
+	defer p.sizeMu.Unlock()
+	p.sizeFailures[sizeZoneKey{zone: zone, size: size}] = time.Now()
+}
+
 func (p *provider) waitZoneOperation(ctx context.Context, name string, zone string) error {
 	var op *compute.Operation
 	for {
@@ -157,7 +232,10 @@ func (p *provider) waitZoneOperation(ctx context.Context, name string, zone stri
 		}
 
 		if op.Error != nil && len(op.Error.Errors) > 0 {
-			return errors.New(op.Error.Errors[0].Message)
+			return &operationError{
+				Code:    op.Error.Errors[0].Code,
+				Message: op.Error.Errors[0].Message,
+			}
 		}
 		if op.Status == "DONE" {
 			return nil
@@ -202,7 +280,10 @@ func (p *provider) waitGlobalOperation(ctx context.Context, name string) error {
 		}
 
 		if op.Error != nil && len(op.Error.Errors) > 0 {
-			return errors.New(op.Error.Errors[0].Message)
+			return &operationError{
+				Code:    op.Error.Errors[0].Code,
+				Message: op.Error.Errors[0].Message,
+			}
 		}
 		if op.Status == "DONE" {
 			return nil

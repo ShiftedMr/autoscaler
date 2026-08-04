@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/avast/retry-go"
@@ -28,6 +29,31 @@ func isTransientError(err error) bool {
 	if gerr, ok := err.(*googleapi.Error); ok {
 		_, isTransient := transientErrorCodes[gerr.Code]
 		return isTransient
+	}
+	return false
+}
+
+// isStockoutError reports whether err indicates the requested machine type
+// has no capacity available in the zone, i.e. a candidate for falling back
+// to the next configured machine type rather than failing outright. Google
+// surfaces this two different ways depending on whether the failure is
+// synchronous (Instances.Insert) or async (a zone operation error):
+//   - a *googleapi.Error with an Errors[].Reason of
+//     "ZONE_RESOURCE_POOL_EXHAUSTED"/"ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS",
+//   - an *operationError with a Code of the same form, or a Message
+//     containing "STOCKOUT" (e.g. "state:STOCKOUT, sub-state:STOCKOUT").
+func isStockoutError(err error) bool {
+	switch e := err.(type) {
+	case *operationError:
+		return strings.Contains(e.Code, "RESOURCE_POOL_EXHAUSTED") ||
+			strings.Contains(e.Message, "STOCKOUT")
+	case *googleapi.Error:
+		for _, item := range e.Errors {
+			if strings.Contains(item.Reason, "RESOURCE_POOL_EXHAUSTED") {
+				return true
+			}
+		}
+		return strings.Contains(e.Message, "STOCKOUT")
 	}
 	return false
 }

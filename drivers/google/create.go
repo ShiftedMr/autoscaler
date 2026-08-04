@@ -9,7 +9,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/rand"
 	"strings"
 
 	"github.com/drone/autoscaler"
@@ -21,6 +20,44 @@ import (
 )
 
 func (p *provider) Create(ctx context.Context, opts autoscaler.InstanceCreateOpts) (*autoscaler.Instance, error) {
+	err := errors.New("no machine types or zones configured")
+
+	// tryAllZones attempts to create an instance of size in every configured
+	// zone (in random order), mirroring the amazon driver's tryCreateInAllSubnets:
+	// every zone is tried regardless of the error a previous zone returned,
+	// and only a successfully provisioned instance short-circuits the loop.
+	tryAllZones := func(size string) (*autoscaler.Instance, error) {
+		var instance *autoscaler.Instance
+		var err error
+		for _, zone := range p.availableZones(size) {
+			instance, err = p.create(ctx, opts, zone, size)
+			if instance != nil {
+				return instance, err
+			}
+			if isStockoutError(err) {
+				p.markSizeFailed(zone, size)
+				logger.FromContext(ctx).
+					WithField("zone", zone).
+					WithField("size", size).
+					WithError(err).
+					Infoln("machine type unavailable in zone, trying next zone")
+			}
+		}
+		return nil, err
+	}
+
+	var instance *autoscaler.Instance
+	for _, size := range p.sizes() {
+		instance, err = tryAllZones(size)
+		if instance != nil {
+			return instance, err
+		}
+	}
+
+	return nil, fmt.Errorf("failed to create instance, all machine types and zones exhausted: %w", err)
+}
+
+func (p *provider) create(ctx context.Context, opts autoscaler.InstanceCreateOpts, zone string, size string) (*autoscaler.Instance, error) {
 	p.init.Do(func() {
 		p.setup(ctx)
 	})
@@ -33,13 +70,10 @@ func (p *provider) Create(ctx context.Context, opts autoscaler.InstanceCreateOpt
 
 	name := strings.ToLower(opts.Name)
 
-	// select random zone from the list
-	zone := p.zones[rand.Intn(len(p.zones))]
-
 	logger := logger.FromContext(ctx).
 		WithField("zone", zone).
 		WithField("image", p.image).
-		WithField("size", p.size).
+		WithField("size", size).
 		WithField("name", opts.Name)
 
 	logger.Debugln("instance insert")
@@ -58,7 +92,7 @@ func (p *provider) Create(ctx context.Context, opts autoscaler.InstanceCreateOpt
 		Name:           name,
 		Zone:           fmt.Sprintf("projects/%s/zones/%s", p.project, zone),
 		MinCpuPlatform: "Automatic",
-		MachineType:    fmt.Sprintf("projects/%s/zones/%s/machineTypes/%s", p.project, zone, p.size),
+		MachineType:    fmt.Sprintf("projects/%s/zones/%s/machineTypes/%s", p.project, zone, size),
 		Metadata: &compute.Metadata{
 			Items: []*compute.MetadataItems{
 				{
@@ -177,7 +211,7 @@ func (p *provider) Create(ctx context.Context, opts autoscaler.InstanceCreateOpt
 		Name:                opts.Name,
 		Image:               p.image,
 		Region:              zone,
-		Size:                p.size,
+		Size:                size,
 		Address:             address,
 		ServiceAccountEmail: p.serviceAccountEmail,
 		Scopes:              p.scopes,

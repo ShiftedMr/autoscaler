@@ -237,6 +237,8 @@ func setupProvider(c config.Config) (autoscaler.Provider, error) {
 			google.WithDiskType(c.Google.DiskType),
 			google.WithMachineImage(c.Google.MachineImage),
 			google.WithMachineType(c.Google.MachineType),
+			google.WithMachineTypeAlt(c.Google.MachineTypeAlt),
+			google.WithMachineTypeCooldown(c.Google.MachineTypeCooldown),
 			google.WithLabels(c.Google.Labels),
 			google.WithNetwork(c.Google.Network),
 			google.WithSubnetwork(c.Google.Subnetwork),
