@@ -17,6 +17,7 @@ func TestOptions(t *testing.T) {
 		WithDiskType("local-ssd"),
 		WithMachineImage("ubuntu-1604-lts"),
 		WithMachineType("c3.large"),
+		WithMachineTypeAlt([]string{"c3.medium"}),
 		WithNetwork("global/defaults/foo"),
 		WithPrivateIP(false),
 		WithServiceAccountEmail("default"),
@@ -52,6 +53,12 @@ func TestOptions(t *testing.T) {
 	}
 	if got, want := p.size, "c3.large"; got != want {
 		t.Errorf("Want size %q, got %q", want, got)
+	}
+	if got, want := p.sizesAlt, []string{"c3.medium"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Want sizesAlt %q, got %q", want, got)
+	}
+	if got, want := p.sizes(), []string{"c3.large", "c3.medium"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Want combined sizes %q, got %q", want, got)
 	}
 	if got, want := len(p.tags), 2; got != want {
 		t.Errorf("Want %d tags, got %d", want, got)

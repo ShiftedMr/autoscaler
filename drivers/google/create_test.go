@@ -8,6 +8,7 @@ import (
 	"context"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/drone/autoscaler"
 	"github.com/h2non/gock"
@@ -302,6 +303,276 @@ func TestCreateWithZoneOperationTransientError(t *testing.T) {
 	}
 	if want, got := instance.ID, "agent-807jvfwj"; got != want {
 		t.Errorf("Want instance ID %q, got %q", want, got)
+	}
+}
+
+func stockoutResponse() map[string]interface{} {
+	return map[string]interface{}{
+		"error": map[string]interface{}{
+			"code": 400,
+			"errors": []map[string]interface{}{
+				{"reason": "ZONE_RESOURCE_POOL_EXHAUSTED"},
+			},
+			"message": "The zone does not have enough resources available",
+		},
+	}
+}
+
+// TestCreateWithZoneFallback verifies that a stockout is retried against
+// every configured zone before falling back to a different machine type,
+// mirroring the amazon driver iterating all subnets before trying sizeAlt
+// (drivers/amazon/create.go:27-69).
+func TestCreateWithZoneFallback(t *testing.T) {
+	defer gock.Off()
+
+	// us-central1-a never has capacity...
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		Persist().
+		Reply(400).
+		JSON(stockoutResponse())
+
+	// ...but us-central1-b always succeeds, with the same (preferred) machine type.
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-b/instances").
+		Persist().
+		Reply(200).
+		BodyString(`{ "name": "operation-name" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-b/operations/operation-name").
+		Persist().
+		Reply(200).
+		BodyString(`{ "status": "DONE" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-b/instances/agent-807jvfwj").
+		Persist().
+		Reply(200).
+		BodyString(`{ "networkInterfaces": [ { "accessConfigs": [ { "natIP": "1.2.3.4" } ] } ] }`)
+
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a", "us-central1-b"),
+		WithProject("my-project"),
+		WithUserData("#cloud-init"),
+		WithMachineType("n1-standard-1"),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+	p.init.Do(func() {})
+
+	instance, err := p.Create(context.TODO(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+	if err != nil {
+		t.Fatalf("expected zone fallback with the same machine type to succeed, got error: %v", err)
+	}
+	if want, got := instance.Region, "us-central1-b"; got != want {
+		t.Errorf("Want instance Region %q, got %q", want, got)
+	}
+	if want, got := instance.Size, "n1-standard-1"; got != want {
+		t.Errorf("Want instance Size %q, got %q", want, got)
+	}
+}
+
+func TestCreateWithMachineTypeFallback(t *testing.T) {
+	defer gock.Off()
+
+	insertInstanceMockAlt4 := *insertInstanceMock
+	insertInstanceMockAlt4.MachineType = "projects/my-project/zones/us-central1-a/machineTypes/n1-standard-4"
+
+	// Primary machine type stockouts on insert in the only configured zone.
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		JSON(&insertInstanceMockAlt4).
+		Reply(400).
+		JSON(stockoutResponse())
+
+	// Fallback machine type succeeds.
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		JSON(insertInstanceMock).
+		Reply(200).
+		BodyString(`{ "name": "operation-name" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/operations/operation-name").
+		Reply(200).
+		BodyString(`{ "status": "DONE" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/instances/agent-807jvfwj").
+		Reply(200).
+		BodyString(`{ "networkInterfaces": [ { "accessConfigs": [ { "natIP": "1.2.3.4" } ] } ] }`)
+
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a"),
+		WithProject("my-project"),
+		WithUserData("#cloud-init"),
+		WithMachineType("n1-standard-4"),
+		WithMachineTypeAlt([]string{"n1-standard-1"}),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+	p.init.Do(func() {})
+
+	instance, err := p.Create(context.TODO(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+	if err != nil {
+		t.Fatalf("expected fallback to succeed, got error: %v", err)
+	}
+
+	if want, got := instance.Size, "n1-standard-1"; got != want {
+		t.Errorf("Want instance Size %q, got %q", want, got)
+	}
+
+	key := sizeZoneKey{zone: "us-central1-a", size: "n1-standard-4"}
+	if _, cooling := p.sizeFailures[key]; !cooling {
+		t.Errorf("expected n1-standard-4 to be marked as failed/cooling down in us-central1-a")
+	}
+}
+
+func TestCreateWithAllMachineTypesExhausted(t *testing.T) {
+	defer gock.Off()
+
+	stockoutReply := func() {
+		gock.New("https://compute.googleapis.com").
+			Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+			Reply(400).
+			JSON(stockoutResponse())
+	}
+	stockoutReply()
+	stockoutReply()
+
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a"),
+		WithProject("my-project"),
+		WithUserData("#cloud-init"),
+		WithMachineType("n1-standard-4"),
+		WithMachineTypeAlt([]string{"n1-standard-1"}),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+	p.init.Do(func() {})
+
+	_, err = p.Create(context.TODO(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+	if err == nil {
+		t.Fatalf("expected error when all machine types are exhausted")
+	}
+}
+
+// TestCreateFallsBackOnAnyError verifies that, like the amazon driver's
+// subnet loop, a candidate is abandoned for the next one regardless of the
+// error's cause - not only on a stockout - since the amazon driver does not
+// discriminate by error type either (amazon/create.go:38-48).
+func TestCreateFallsBackOnAnyError(t *testing.T) {
+	defer gock.Off()
+
+	insertInstanceMockAlt4 := *insertInstanceMock
+	insertInstanceMockAlt4.MachineType = "projects/my-project/zones/us-central1-a/machineTypes/n1-standard-4"
+
+	// Primary machine type fails for a reason unrelated to capacity.
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		JSON(&insertInstanceMockAlt4).
+		Reply(403).
+		JSON(map[string]interface{}{
+			"error": map[string]interface{}{
+				"code":    403,
+				"message": "insufficient permissions",
+			},
+		})
+
+	// Fallback machine type succeeds.
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		JSON(insertInstanceMock).
+		Reply(200).
+		BodyString(`{ "name": "operation-name" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/operations/operation-name").
+		Reply(200).
+		BodyString(`{ "status": "DONE" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/instances/agent-807jvfwj").
+		Reply(200).
+		BodyString(`{ "networkInterfaces": [ { "accessConfigs": [ { "natIP": "1.2.3.4" } ] } ] }`)
+
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a"),
+		WithProject("my-project"),
+		WithUserData("#cloud-init"),
+		WithMachineType("n1-standard-4"),
+		WithMachineTypeAlt([]string{"n1-standard-1"}),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+	p.init.Do(func() {})
+
+	instance, err := p.Create(context.TODO(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+	if err != nil {
+		t.Fatalf("expected fallback to be attempted despite a non-stockout error, got error: %v", err)
+	}
+	if want, got := instance.Size, "n1-standard-1"; got != want {
+		t.Errorf("Want instance Size %q, got %q", want, got)
+	}
+
+	// a non-stockout error should not put the primary type into cooldown.
+	key := sizeZoneKey{zone: "us-central1-a", size: "n1-standard-4"}
+	if _, cooling := p.sizeFailures[key]; cooling {
+		t.Errorf("expected n1-standard-4 to not be marked as cooling down for a non-stockout error")
+	}
+}
+
+func TestAvailableZonesCooldown(t *testing.T) {
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a", "us-central1-b"),
+		WithMachineType("n1-standard-4"),
+		WithMachineTypeAlt([]string{"n1-standard-1"}),
+		WithMachineTypeCooldown(time.Minute),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+
+	p.markSizeFailed("us-central1-a", "n1-standard-4")
+
+	got := p.availableZones("n1-standard-4")
+	want := []string{"us-central1-b"}
+	if len(got) != 1 || got[0] != want[0] {
+		t.Errorf("Want available zones %v, got %v", want, got)
+	}
+
+	// cooldown is scoped per machine type: a different size is unaffected by
+	// the failure recorded against n1-standard-4 in us-central1-a.
+	gotAlt := p.availableZones("n1-standard-1")
+	if len(gotAlt) != 2 {
+		t.Errorf("Want cooldown scoped to the failed size only, got %v available zones for n1-standard-1", gotAlt)
+	}
+
+	// once every zone has failed for a size, cooldown is ignored so we never run dry.
+	p.markSizeFailed("us-central1-b", "n1-standard-4")
+	got = p.availableZones("n1-standard-4")
+	if len(got) != 2 {
+		t.Errorf("Want cooldown ignored when all zones have failed, got %v", got)
 	}
 }
 
