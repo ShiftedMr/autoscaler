@@ -27,7 +27,7 @@ func (p *provider) Create(ctx context.Context, opts autoscaler.InstanceCreateOpt
 	// when the failure was actually a stockout.
 	tryAllZones := func(size string) (*autoscaler.Instance, error) {
 		var instance *autoscaler.Instance
-		var err error
+		err := fmt.Errorf("no zones configured for machine type %q", size)
 		for _, zone := range p.availableZones(size) {
 			instance, err = p.create(ctx, opts, zone, size)
 			if instance != nil {

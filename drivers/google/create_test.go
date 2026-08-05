@@ -7,6 +7,7 @@ package google
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -565,6 +566,27 @@ func TestAvailableZonesCooldown(t *testing.T) {
 	got = p.availableZones("n1-standard-4")
 	if len(got) != 2 {
 		t.Errorf("Want cooldown ignored when all zones have failed, got %v", got)
+	}
+}
+
+// TestCreateWithNoZonesConfigured guards against a provider with no zones
+// configured (e.g. constructed without New's defaults) returning a nil
+// error, which would otherwise surface as an unhelpful "%!w(<nil>)".
+func TestCreateWithNoZonesConfigured(t *testing.T) {
+	v, err := New(WithClient(http.DefaultClient))
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+	p.zones = nil
+
+	_, err = p.Create(context.TODO(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+	if err == nil {
+		t.Fatalf("expected an error when no zones are configured")
+	}
+	if strings.Contains(err.Error(), "<nil>") {
+		t.Errorf("expected a descriptive error, got %q", err.Error())
 	}
 }
 

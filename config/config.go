@@ -163,7 +163,7 @@ type (
 
 		Google struct {
 			MachineType         string            `envconfig:"DRONE_GOOGLE_MACHINE_TYPE"`
-			MachineTypeAlt      []string          `envconfig:"DRONE_GOOGLE_MACHINE_TYPE_ALT"` // In the same manner as Amazon's InstanceAlt, allows fallback to other machine types if provisioning the primary type fails due to a stockout
+			MachineTypeAlt      []string          `envconfig:"DRONE_GOOGLE_MACHINE_TYPE_ALT"` // In the same manner as Amazon's InstanceAlt, allows fallback to other machine types if provisioning the primary type fails for any reason; a stockout additionally puts the failed (zone, type) pair into cooldown
 			MachineTypeCooldown time.Duration     `envconfig:"DRONE_GOOGLE_MACHINE_TYPE_COOLDOWN" default:"10m"`
 			MachineImage        string            `envconfig:"DRONE_GOOGLE_MACHINE_IMAGE"`
 			Network             string            `envconfig:"DRONE_GOOGLE_NETWORK"`
