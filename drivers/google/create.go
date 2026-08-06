@@ -38,11 +38,6 @@ func (p *provider) Create(ctx context.Context, opts autoscaler.InstanceCreateOpt
 	// continuing past non-stockout errors too. A rate-limit response waits
 	// out the server-requested backoff and retries the same zone, since
 	// moving to a different zone won't avoid a project-level rate limit.
-	//
-	// This previously also put a (zone, size) pair that stocked out into a
-	// cooldown so it would be skipped for a while; that's been pulled out
-	// for now (see shuffledZones) while we revisit the right design, so a
-	// stockout here is just logged, not remembered across calls.
 	tryAllZones := func(size string) (*autoscaler.Instance, error) {
 		var instance *autoscaler.Instance
 		// Must stay non-nil: if p.zones is ever empty the loop below never

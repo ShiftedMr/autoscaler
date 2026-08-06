@@ -149,11 +149,6 @@ func (p *provider) sizes() []string {
 
 // shuffledZones returns p.zones in random order, so repeated Create calls
 // don't all hammer the same zone first.
-//
-// This previously also skipped zones that had recently stocked out for a
-// given machine type (a cooldown, keyed per (zone, size)); that's been
-// pulled out for now to keep this simpler while we revisit the right
-// cooldown design, and may come back later.
 func (p *provider) shuffledZones() []string {
 	zones := make([]string, len(p.zones))
 	copy(zones, p.zones)
