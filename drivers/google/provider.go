@@ -60,10 +60,6 @@ type provider struct {
 
 	rateLimiter *rate.Limiter
 
-	sizeCooldown time.Duration
-	sizeMu       sync.Mutex
-	sizeFailures map[sizeZoneKey]time.Time
-
 	// createSearchTimeout bounds how long Create spends cycling through
 	// zone/machine-type combinations; see the comment on Create for why.
 	createSearchTimeout time.Duration
@@ -89,14 +85,8 @@ func New(opts ...Option) (autoscaler.Provider, error) {
 	if p.size == "" {
 		p.size = "n1-standard-1"
 	}
-	if p.sizeCooldown == 0 {
-		p.sizeCooldown = 10 * time.Minute
-	}
 	if p.createSearchTimeout == 0 {
 		p.createSearchTimeout = 5 * time.Minute
-	}
-	if p.sizeFailures == nil {
-		p.sizeFailures = map[sizeZoneKey]time.Time{}
 	}
 	if p.image == "" {
 		p.image = "ubuntu-os-cloud/global/images/ubuntu-2004-focal-v20220712"
@@ -157,45 +147,20 @@ func (p *provider) sizes() []string {
 	return append([]string{p.size}, p.sizesAlt...)
 }
 
-// sizeZoneKey scopes cooldown state to a specific zone, since a stockout is
-// a property of a (zone, machine type) pair, not of the machine type alone.
-type sizeZoneKey struct {
-	zone string
-	size string
-}
-
-// availableZones returns p.zones in random order with any zone currently
-// cooling down for size filtered out. If every zone is cooling down, the
-// cooldown is ignored and the full list is returned instead.
-func (p *provider) availableZones(size string) []string {
+// shuffledZones returns p.zones in random order, so repeated Create calls
+// don't all hammer the same zone first.
+//
+// This previously also skipped zones that had recently stocked out for a
+// given machine type (a cooldown, keyed per (zone, size)); that's been
+// pulled out for now to keep this simpler while we revisit the right
+// cooldown design, and may come back later.
+func (p *provider) shuffledZones() []string {
 	zones := make([]string, len(p.zones))
 	copy(zones, p.zones)
 	rand.Shuffle(len(zones), func(i, j int) {
 		zones[i], zones[j] = zones[j], zones[i]
 	})
-
-	p.sizeMu.Lock()
-	defer p.sizeMu.Unlock()
-
-	now := time.Now()
-	available := make([]string, 0, len(zones))
-	for _, zone := range zones {
-		key := sizeZoneKey{zone: zone, size: size}
-		if failedAt, ok := p.sizeFailures[key]; ok && now.Sub(failedAt) < p.sizeCooldown {
-			continue
-		}
-		available = append(available, zone)
-	}
-	if len(available) == 0 {
-		return zones
-	}
-	return available
-}
-
-func (p *provider) markSizeFailed(zone, size string) {
-	p.sizeMu.Lock()
-	defer p.sizeMu.Unlock()
-	p.sizeFailures[sizeZoneKey{zone: zone, size: size}] = time.Now()
+	return zones
 }
 
 func (p *provider) waitZoneOperation(ctx context.Context, name string, zone string) error {

@@ -73,13 +73,6 @@ func WithMachineTypeAlt(sizes []string) Option {
 	}
 }
 
-// WithMachineTypeCooldown returns an option to set the stockout cooldown.
-func WithMachineTypeCooldown(cooldown time.Duration) Option {
-	return func(p *provider) {
-		p.sizeCooldown = cooldown
-	}
-}
-
 // WithNetwork returns an option to set the network.
 func WithNetwork(network string) Option {
 	return func(p *provider) {

@@ -427,11 +427,6 @@ func TestCreateWithMachineTypeFallback(t *testing.T) {
 	if want, got := instance.Size, "n1-standard-1"; got != want {
 		t.Errorf("Want instance Size %q, got %q", want, got)
 	}
-
-	key := sizeZoneKey{zone: "us-central1-a", size: "n1-standard-4"}
-	if _, cooling := p.sizeFailures[key]; !cooling {
-		t.Errorf("expected n1-standard-4 to be marked as failed/cooling down in us-central1-a")
-	}
 }
 
 func TestCreateWithAllMachineTypesExhausted(t *testing.T) {
@@ -524,21 +519,12 @@ func TestCreateFallsBackOnAnyError(t *testing.T) {
 	if want, got := instance.Size, "n1-standard-1"; got != want {
 		t.Errorf("Want instance Size %q, got %q", want, got)
 	}
-
-	// a non-stockout error should not put the primary type into cooldown.
-	key := sizeZoneKey{zone: "us-central1-a", size: "n1-standard-4"}
-	if _, cooling := p.sizeFailures[key]; cooling {
-		t.Errorf("expected n1-standard-4 to not be marked as cooling down for a non-stockout error")
-	}
 }
 
-func TestAvailableZonesCooldown(t *testing.T) {
+func TestShuffledZones(t *testing.T) {
 	v, err := New(
 		WithClient(http.DefaultClient),
-		WithZones("us-central1-a", "us-central1-b"),
-		WithMachineType("n1-standard-4"),
-		WithMachineTypeAlt([]string{"n1-standard-1"}),
-		WithMachineTypeCooldown(time.Minute),
+		WithZones("us-central1-a", "us-central1-b", "us-central1-c"),
 	)
 	if err != nil {
 		t.Error(err)
@@ -546,27 +532,25 @@ func TestAvailableZonesCooldown(t *testing.T) {
 	}
 	p := v.(*provider)
 
-	p.markSizeFailed("us-central1-a", "n1-standard-4")
-
-	got := p.availableZones("n1-standard-4")
-	want := []string{"us-central1-b"}
-	if len(got) != 1 || got[0] != want[0] {
-		t.Errorf("Want available zones %v, got %v", want, got)
+	got := p.shuffledZones()
+	want := []string{"us-central1-a", "us-central1-b", "us-central1-c"}
+	if len(got) != len(want) {
+		t.Fatalf("Want %d zones, got %d", len(want), len(got))
 	}
-
-	// cooldown is scoped per machine type: a different size is unaffected by
-	// the failure recorded against n1-standard-4 in us-central1-a.
-	gotAlt := p.availableZones("n1-standard-1")
-	if len(gotAlt) != 2 {
-		t.Errorf("Want cooldown scoped to the failed size only, got %v available zones for n1-standard-1", gotAlt)
+	for _, zone := range want {
+		if !contains(got, zone) {
+			t.Errorf("Want %v to contain %q", got, zone)
+		}
 	}
+}
 
-	// once every zone has failed for a size, cooldown is ignored so we never run dry.
-	p.markSizeFailed("us-central1-b", "n1-standard-4")
-	got = p.availableZones("n1-standard-4")
-	if len(got) != 2 {
-		t.Errorf("Want cooldown ignored when all zones have failed, got %v", got)
+func contains(list []string, item string) bool {
+	for _, v := range list {
+		if v == item {
+			return true
+		}
 	}
+	return false
 }
 
 // TestCreateWithNoZonesConfigured guards against a provider with no zones

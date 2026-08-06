@@ -41,11 +41,10 @@ func isTransientError(err error) bool {
 // free-text message containing "STOCKOUT" (as in the original bug report).
 //
 // QUOTA_EXCEEDED is deliberately not treated as a stockout: it's a
-// project-level limit rather than a (zone, machine type) capacity issue, so
-// cooling down a specific zone for it would be misleading, and it won't
-// necessarily clear on the same timescale a capacity fluctuation does. The
-// fallback loop in Create still retries other candidates for it regardless -
-// isStockoutError only controls cooldown bookkeeping, not whether to move on.
+// project-level limit rather than a (zone, machine type) capacity issue.
+// Create's fallback loop tries the next zone/machine type on any error
+// regardless of this check; isStockoutError currently only distinguishes a
+// stockout for logging purposes.
 func isStockoutError(err error) bool {
 	hasStockoutSignal := func(s string) bool {
 		return strings.Contains(s, "RESOURCE_POOL_EXHAUSTED") || strings.Contains(s, "STOCKOUT")

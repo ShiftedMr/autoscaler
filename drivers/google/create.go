@@ -35,17 +35,21 @@ func (p *provider) Create(ctx context.Context, opts autoscaler.InstanceCreateOpt
 	err := errors.New("no machine types or zones configured")
 
 	// tryAllZones attempts size in every configured zone (random order),
-	// continuing past non-stockout errors too, and only records a cooldown
-	// when the failure was actually a stockout. A rate-limit response waits
+	// continuing past non-stockout errors too. A rate-limit response waits
 	// out the server-requested backoff and retries the same zone, since
 	// moving to a different zone won't avoid a project-level rate limit.
+	//
+	// This previously also put a (zone, size) pair that stocked out into a
+	// cooldown so it would be skipped for a while; that's been pulled out
+	// for now (see shuffledZones) while we revisit the right design, so a
+	// stockout here is just logged, not remembered across calls.
 	tryAllZones := func(size string) (*autoscaler.Instance, error) {
 		var instance *autoscaler.Instance
-		// Must stay non-nil: if availableZones(size) is ever empty the loop
-		// below never runs, and this is what gets wrapped into the error
-		// Create ultimately returns. See TestCreateWithNoZonesConfigured.
+		// Must stay non-nil: if p.zones is ever empty the loop below never
+		// runs, and this is what gets wrapped into the error Create
+		// ultimately returns. See TestCreateWithNoZonesConfigured.
 		err := fmt.Errorf("no zones configured for machine type %q", size)
-		for _, zone := range p.availableZones(size) {
+		for _, zone := range p.shuffledZones() {
 			for {
 				instance, err = p.createInZone(ctx, opts, zone, size)
 				if instance != nil {
@@ -67,7 +71,6 @@ func (p *provider) Create(ctx context.Context, opts autoscaler.InstanceCreateOpt
 				}
 			}
 			if isStockoutError(err) {
-				p.markSizeFailed(zone, size)
 				logger.FromContext(ctx).
 					WithField("zone", zone).
 					WithField("size", size).
