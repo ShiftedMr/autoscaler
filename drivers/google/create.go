@@ -24,18 +24,15 @@ import (
 // every configured zone before giving up. createSearchTimeout bounds the
 // total time spent doing so: an async stockout is only discovered after
 // actually polling the zone operation for real wall-clock time, and that
-// cost multiplies by every (zone, size) combination, so without a cap a
-// broad outage would slowly work through the full list before the caller's
-// own (much longer) context deadline finally cuts it off, needlessly
-// delaying failure detection.
+// cost multiplies by every (zone, size) combinatio.
 func (p *provider) Create(ctx context.Context, opts autoscaler.InstanceCreateOpts) (*autoscaler.Instance, error) {
 	ctx, cancel := context.WithTimeout(ctx, p.createSearchTimeout)
 	defer cancel()
 
 	err := errors.New("no machine types or zones configured")
 
-	// tryAllZones attempts size in every configured zone (random order),
-	// continuing past non-stockout errors too. A rate-limit response waits
+	// tryAllZones attempts size in every configured zone (random zone order),
+	// continuing past each possible error. A rate-limit response waits
 	// out the server-requested backoff and retries the same zone, since
 	// moving to a different zone won't avoid a project-level rate limit.
 	tryAllZones := func(size string) (*autoscaler.Instance, error) {
@@ -210,8 +207,8 @@ func (p *provider) createInZone(ctx context.Context, opts autoscaler.InstanceCre
 	err = p.waitZoneOperation(ctx, op.Name, zone)
 	if err != nil {
 		entry := logger.WithError(err)
-		// operationError.Error() only renders Message; surface Code (e.g.
-		// "QUOTA_EXCEEDED") as a field too so it isn't lost from the log.
+		// operationError.Error() only renders Message;
+		// This will surface useful error codes like QUOTA_EXCEEDED
 		var opErr *operationError
 		if errors.As(err, &opErr) && opErr.Code != "" {
 			entry = entry.WithField("code", opErr.Code)
