@@ -41,6 +41,9 @@ func (p *provider) Create(ctx context.Context, opts autoscaler.InstanceCreateOpt
 	// moving to a different zone won't avoid a project-level rate limit.
 	tryAllZones := func(size string) (*autoscaler.Instance, error) {
 		var instance *autoscaler.Instance
+		// Must stay non-nil: if availableZones(size) is ever empty the loop
+		// below never runs, and this is what gets wrapped into the error
+		// Create ultimately returns. See TestCreateWithNoZonesConfigured.
 		err := fmt.Errorf("no zones configured for machine type %q", size)
 		for _, zone := range p.availableZones(size) {
 			for {
