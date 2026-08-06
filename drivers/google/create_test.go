@@ -590,6 +590,111 @@ func TestCreateWithNoZonesConfigured(t *testing.T) {
 	}
 }
 
+// TestCreateRetriesSameZoneOnRateLimit verifies that a 429 causes Create to
+// wait out the Retry-After duration and retry the same zone, rather than
+// immediately moving on to a different candidate (moving on wouldn't avoid
+// a project-level rate limit, and would only add more load while throttled).
+func TestCreateRetriesSameZoneOnRateLimit(t *testing.T) {
+	defer gock.Off()
+
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		JSON(insertInstanceMock).
+		Reply(429).
+		AddHeader("Retry-After", "0").
+		JSON(map[string]interface{}{
+			"error": map[string]interface{}{
+				"code":    429,
+				"message": "Too Many Requests",
+			},
+		})
+
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		JSON(insertInstanceMock).
+		Reply(200).
+		BodyString(`{ "name": "operation-name" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/operations/operation-name").
+		Reply(200).
+		BodyString(`{ "status": "DONE" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/instances/agent-807jvfwj").
+		Reply(200).
+		BodyString(`{ "networkInterfaces": [ { "accessConfigs": [ { "natIP": "1.2.3.4" } ] } ] }`)
+
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a"),
+		WithProject("my-project"),
+		WithUserData("#cloud-init"),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+	p.init.Do(func() {})
+
+	instance, err := p.Create(context.TODO(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+	if err != nil {
+		t.Fatalf("expected the same zone to be retried after the rate limit, got error: %v", err)
+	}
+	if want, got := instance.Region, "us-central1-a"; got != want {
+		t.Errorf("Want instance Region %q, got %q", want, got)
+	}
+}
+
+// TestCreateRespectsSearchTimeout verifies that Create gives up once
+// createSearchTimeout elapses instead of exhausting every zone/machine-type
+// combination, each with its own retry budget, against a persistently
+// failing backend.
+func TestCreateRespectsSearchTimeout(t *testing.T) {
+	defer gock.Off()
+
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		Persist().
+		Reply(503).
+		JSON(map[string]interface{}{
+			"error": map[string]interface{}{
+				"code":    503,
+				"message": "Service Unavailable",
+			},
+		})
+
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a"),
+		WithProject("my-project"),
+		WithUserData("#cloud-init"),
+		WithMachineType("n1-standard-4"),
+		WithMachineTypeAlt([]string{"n1-standard-2", "n1-standard-1"}),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+	p.init.Do(func() {})
+	p.createSearchTimeout = 50 * time.Millisecond
+
+	start := time.Now()
+	_, err = p.Create(context.TODO(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("expected an error once the search timeout elapses")
+	}
+	// generous upper bound: well under what exhausting 3 machine types'
+	// full 5-attempt retry budgets against a persistent 503 would take.
+	if elapsed > 2*time.Second {
+		t.Errorf("expected Create to give up close to createSearchTimeout, took %s", elapsed)
+	}
+}
+
 func TestCreateWithInsertTransientError(t *testing.T) {
 	defer gock.Off()
 

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/drone/autoscaler"
 	"github.com/drone/autoscaler/logger"
@@ -19,19 +20,48 @@ import (
 	"google.golang.org/api/googleapi"
 )
 
+// Create provisions an instance, trying every configured machine type across
+// every configured zone before giving up. createSearchTimeout bounds the
+// total time spent doing so: an async stockout is only discovered after
+// actually polling the zone operation for real wall-clock time, and that
+// cost multiplies by every (zone, size) combination, so without a cap a
+// broad outage would slowly work through the full list before the caller's
+// own (much longer) context deadline finally cuts it off, needlessly
+// delaying failure detection.
 func (p *provider) Create(ctx context.Context, opts autoscaler.InstanceCreateOpts) (*autoscaler.Instance, error) {
+	ctx, cancel := context.WithTimeout(ctx, p.createSearchTimeout)
+	defer cancel()
+
 	err := errors.New("no machine types or zones configured")
 
 	// tryAllZones attempts size in every configured zone (random order),
 	// continuing past non-stockout errors too, and only records a cooldown
-	// when the failure was actually a stockout.
+	// when the failure was actually a stockout. A rate-limit response waits
+	// out the server-requested backoff and retries the same zone, since
+	// moving to a different zone won't avoid a project-level rate limit.
 	tryAllZones := func(size string) (*autoscaler.Instance, error) {
 		var instance *autoscaler.Instance
 		err := fmt.Errorf("no zones configured for machine type %q", size)
 		for _, zone := range p.availableZones(size) {
-			instance, err = p.create(ctx, opts, zone, size)
-			if instance != nil {
-				return instance, err
+			for {
+				instance, err = p.createInZone(ctx, opts, zone, size)
+				if instance != nil {
+					return instance, err
+				}
+				rl, ok := err.(*retryAfterError)
+				if !ok {
+					break
+				}
+				logger.FromContext(ctx).
+					WithField("zone", zone).
+					WithField("size", size).
+					WithField("retryAfter", rl.retryAfter).
+					Infoln("rate limited, waiting before retrying the same zone")
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(rl.retryAfter):
+				}
 			}
 			if isStockoutError(err) {
 				p.markSizeFailed(zone, size)
@@ -56,7 +86,9 @@ func (p *provider) Create(ctx context.Context, opts autoscaler.InstanceCreateOpt
 	return nil, fmt.Errorf("failed to create instance, all machine types and zones exhausted: %w", err)
 }
 
-func (p *provider) create(ctx context.Context, opts autoscaler.InstanceCreateOpts, zone string, size string) (*autoscaler.Instance, error) {
+// createInZone provisions a single instance of size in zone, without any
+// zone or machine-type fallback of its own; see Create for that.
+func (p *provider) createInZone(ctx context.Context, opts autoscaler.InstanceCreateOpts, zone string, size string) (*autoscaler.Instance, error) {
 	p.init.Do(func() {
 		p.setup(ctx)
 	})

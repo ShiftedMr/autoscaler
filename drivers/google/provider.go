@@ -64,6 +64,10 @@ type provider struct {
 	sizeMu       sync.Mutex
 	sizeFailures map[sizeZoneKey]time.Time
 
+	// createSearchTimeout bounds how long Create spends cycling through
+	// zone/machine-type combinations; see the comment on Create for why.
+	createSearchTimeout time.Duration
+
 	service *compute.Service
 }
 
@@ -87,6 +91,9 @@ func New(opts ...Option) (autoscaler.Provider, error) {
 	}
 	if p.sizeCooldown == 0 {
 		p.sizeCooldown = 10 * time.Minute
+	}
+	if p.createSearchTimeout == 0 {
+		p.createSearchTimeout = 5 * time.Minute
 	}
 	if p.sizeFailures == nil {
 		p.sizeFailures = map[sizeZoneKey]time.Time{}

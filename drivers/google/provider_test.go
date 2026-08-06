@@ -53,6 +53,9 @@ func TestDefaults(t *testing.T) {
 	if got, want := p.sizeCooldown, 10*time.Minute; got != want {
 		t.Errorf("Want default sizeCooldown %s, got %s", want, got)
 	}
+	if got, want := p.createSearchTimeout, 5*time.Minute; got != want {
+		t.Errorf("Want default createSearchTimeout %s, got %s", want, got)
+	}
 	if !reflect.DeepEqual(p.tags, defaultTags) {
 		t.Errorf("Want default tags")
 	}
