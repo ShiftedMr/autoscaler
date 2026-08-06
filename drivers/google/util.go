@@ -2,8 +2,10 @@ package google
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/avast/retry-go"
@@ -28,6 +30,37 @@ func isTransientError(err error) bool {
 	if gerr, ok := err.(*googleapi.Error); ok {
 		_, isTransient := transientErrorCodes[gerr.Code]
 		return isTransient
+	}
+	return false
+}
+
+// isStockoutError reports whether err is a zone capacity failure. Google
+// returns this as a *googleapi.Error Reason on a synchronous Insert failure,
+// or as an *operationError Code/Message on an async operation failure. The
+// known values are "ZONE_RESOURCE_POOL_EXHAUSTED"/"..._WITH_DETAILS", or a
+// free-text message containing "STOCKOUT" (as in the original bug report).
+func isStockoutError(err error) bool {
+	hasStockoutSignal := func(s string) bool {
+		return strings.Contains(s, "RESOURCE_POOL_EXHAUSTED") || strings.Contains(s, "STOCKOUT")
+	}
+
+	// errors.As rather than a direct type assertion, so this keeps working
+	// if a caller ever wraps one of these with fmt.Errorf("...: %w", err).
+	var opErr *operationError
+	if errors.As(err, &opErr) {
+		return hasStockoutSignal(opErr.Code) || hasStockoutSignal(opErr.Message)
+	}
+
+	var gerr *googleapi.Error
+	if errors.As(err, &gerr) {
+		if hasStockoutSignal(gerr.Message) {
+			return true
+		}
+		for _, item := range gerr.Errors {
+			if hasStockoutSignal(item.Reason) || hasStockoutSignal(item.Message) {
+				return true
+			}
+		}
 	}
 	return false
 }

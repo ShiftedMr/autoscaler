@@ -284,6 +284,7 @@ var jsonConfig = []byte(`{
   "Google": {
     "Zone": ["us-central1-b","us-central1-a"],
     "MachineType": "f1-micro",
+    "MachineTypeAlt": null,
     "MachineImage": "ubuntu-1510-wily-v20151114",
     "DiskType": "pd-standard",
     "Address": "",

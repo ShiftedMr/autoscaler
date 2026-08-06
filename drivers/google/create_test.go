@@ -7,10 +7,15 @@ package google
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/drone/autoscaler"
+	"github.com/drone/autoscaler/logger"
 	"github.com/h2non/gock"
+	"github.com/sirupsen/logrus"
+	logrustest "github.com/sirupsen/logrus/hooks/test"
 
 	"google.golang.org/api/compute/v1"
 	"google.golang.org/api/googleapi"
@@ -302,6 +307,441 @@ func TestCreateWithZoneOperationTransientError(t *testing.T) {
 	}
 	if want, got := instance.ID, "agent-807jvfwj"; got != want {
 		t.Errorf("Want instance ID %q, got %q", want, got)
+	}
+}
+
+// TestCreateLogsOperationErrorCode verifies that when a zone operation fails
+// with a structured Code (e.g. QUOTA_EXCEEDED), that code is still visible
+// in the log even though operationError.Error() only renders Message.
+func TestCreateLogsOperationErrorCode(t *testing.T) {
+	defer gock.Off()
+
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		JSON(insertInstanceMock).
+		Reply(200).
+		BodyString(`{ "name": "operation-name" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/operations/operation-name").
+		Reply(200).
+		JSON(map[string]interface{}{
+			"status": "DONE",
+			"error": map[string]interface{}{
+				"errors": []map[string]interface{}{
+					{
+						"code":    "QUOTA_EXCEEDED",
+						"message": "Quota 'CPUS' exceeded. Limit: 24.0 in region us-central1.",
+					},
+				},
+			},
+		})
+
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a"),
+		WithProject("my-project"),
+		WithUserData("#cloud-init"),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+	p.init.Do(func() {})
+
+	logrusLogger, hook := logrustest.NewNullLogger()
+	ctx := logger.WithContext(context.TODO(), logger.Logrus(logrus.NewEntry(logrusLogger)))
+
+	_, err = p.Create(ctx, autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+	if err == nil {
+		t.Fatalf("expected an error from the failed operation")
+	}
+
+	var found *logrus.Entry
+	for _, entry := range hook.AllEntries() {
+		if entry.Message == "instance insert operation failed" {
+			found = entry
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("expected an \"instance insert operation failed\" log entry, got entries: %v", hook.AllEntries())
+	}
+	if got, want := found.Data["code"], "QUOTA_EXCEEDED"; got != want {
+		t.Errorf("Want log field code %q, got %q", want, got)
+	}
+}
+
+func stockoutResponse() map[string]interface{} {
+	return map[string]interface{}{
+		"error": map[string]interface{}{
+			"code": 400,
+			"errors": []map[string]interface{}{
+				{"reason": "ZONE_RESOURCE_POOL_EXHAUSTED"},
+			},
+			"message": "The zone does not have enough resources available",
+		},
+	}
+}
+
+func TestCreateWithZoneFallback(t *testing.T) {
+	defer gock.Off()
+
+	// us-central1-a never has capacity...
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		Persist().
+		Reply(400).
+		JSON(stockoutResponse())
+
+	// ...but us-central1-b always succeeds, with the same (preferred) machine type.
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-b/instances").
+		Persist().
+		Reply(200).
+		BodyString(`{ "name": "operation-name" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-b/operations/operation-name").
+		Persist().
+		Reply(200).
+		BodyString(`{ "status": "DONE" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-b/instances/agent-807jvfwj").
+		Persist().
+		Reply(200).
+		BodyString(`{ "networkInterfaces": [ { "accessConfigs": [ { "natIP": "1.2.3.4" } ] } ] }`)
+
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a", "us-central1-b"),
+		WithProject("my-project"),
+		WithUserData("#cloud-init"),
+		WithMachineType("n1-standard-1"),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+	p.init.Do(func() {})
+
+	instance, err := p.Create(context.TODO(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+	if err != nil {
+		t.Fatalf("expected zone fallback with the same machine type to succeed, got error: %v", err)
+	}
+	if want, got := instance.Region, "us-central1-b"; got != want {
+		t.Errorf("Want instance Region %q, got %q", want, got)
+	}
+	if want, got := instance.Size, "n1-standard-1"; got != want {
+		t.Errorf("Want instance Size %q, got %q", want, got)
+	}
+}
+
+func TestCreateWithMachineTypeFallback(t *testing.T) {
+	defer gock.Off()
+
+	insertInstanceMockAlt4 := *insertInstanceMock
+	insertInstanceMockAlt4.MachineType = "projects/my-project/zones/us-central1-a/machineTypes/n1-standard-4"
+
+	// Primary machine type stockouts on insert in the only configured zone.
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		JSON(&insertInstanceMockAlt4).
+		Reply(400).
+		JSON(stockoutResponse())
+
+	// Fallback machine type succeeds.
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		JSON(insertInstanceMock).
+		Reply(200).
+		BodyString(`{ "name": "operation-name" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/operations/operation-name").
+		Reply(200).
+		BodyString(`{ "status": "DONE" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/instances/agent-807jvfwj").
+		Reply(200).
+		BodyString(`{ "networkInterfaces": [ { "accessConfigs": [ { "natIP": "1.2.3.4" } ] } ] }`)
+
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a"),
+		WithProject("my-project"),
+		WithUserData("#cloud-init"),
+		WithMachineType("n1-standard-4"),
+		WithMachineTypeAlt([]string{"n1-standard-1"}),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+	p.init.Do(func() {})
+
+	instance, err := p.Create(context.TODO(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+	if err != nil {
+		t.Fatalf("expected fallback to succeed, got error: %v", err)
+	}
+
+	if want, got := instance.Size, "n1-standard-1"; got != want {
+		t.Errorf("Want instance Size %q, got %q", want, got)
+	}
+}
+
+func TestCreateWithAllMachineTypesExhausted(t *testing.T) {
+	defer gock.Off()
+
+	stockoutReply := func() {
+		gock.New("https://compute.googleapis.com").
+			Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+			Reply(400).
+			JSON(stockoutResponse())
+	}
+	stockoutReply()
+	stockoutReply()
+
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a"),
+		WithProject("my-project"),
+		WithUserData("#cloud-init"),
+		WithMachineType("n1-standard-4"),
+		WithMachineTypeAlt([]string{"n1-standard-1"}),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+	p.init.Do(func() {})
+
+	_, err = p.Create(context.TODO(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+	if err == nil {
+		t.Fatalf("expected error when all machine types are exhausted")
+	}
+}
+
+func TestCreateFallsBackOnAnyError(t *testing.T) {
+	defer gock.Off()
+
+	insertInstanceMockAlt4 := *insertInstanceMock
+	insertInstanceMockAlt4.MachineType = "projects/my-project/zones/us-central1-a/machineTypes/n1-standard-4"
+
+	// Primary machine type fails for a reason unrelated to capacity.
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		JSON(&insertInstanceMockAlt4).
+		Reply(403).
+		JSON(map[string]interface{}{
+			"error": map[string]interface{}{
+				"code":    403,
+				"message": "insufficient permissions",
+			},
+		})
+
+	// Fallback machine type succeeds.
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		JSON(insertInstanceMock).
+		Reply(200).
+		BodyString(`{ "name": "operation-name" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/operations/operation-name").
+		Reply(200).
+		BodyString(`{ "status": "DONE" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/instances/agent-807jvfwj").
+		Reply(200).
+		BodyString(`{ "networkInterfaces": [ { "accessConfigs": [ { "natIP": "1.2.3.4" } ] } ] }`)
+
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a"),
+		WithProject("my-project"),
+		WithUserData("#cloud-init"),
+		WithMachineType("n1-standard-4"),
+		WithMachineTypeAlt([]string{"n1-standard-1"}),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+	p.init.Do(func() {})
+
+	instance, err := p.Create(context.TODO(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+	if err != nil {
+		t.Fatalf("expected fallback to be attempted despite a non-stockout error, got error: %v", err)
+	}
+	if want, got := instance.Size, "n1-standard-1"; got != want {
+		t.Errorf("Want instance Size %q, got %q", want, got)
+	}
+}
+
+func TestShuffledZones(t *testing.T) {
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a", "us-central1-b", "us-central1-c"),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+
+	got := p.shuffledZones()
+	want := []string{"us-central1-a", "us-central1-b", "us-central1-c"}
+	if len(got) != len(want) {
+		t.Fatalf("Want %d zones, got %d", len(want), len(got))
+	}
+	for _, zone := range want {
+		if !contains(got, zone) {
+			t.Errorf("Want %v to contain %q", got, zone)
+		}
+	}
+}
+
+func contains(list []string, item string) bool {
+	for _, v := range list {
+		if v == item {
+			return true
+		}
+	}
+	return false
+}
+
+// TestCreateWithNoZonesConfigured guards against a provider with no zones
+// configured (e.g. constructed without New's defaults) returning a nil
+// error, which would otherwise surface as an unhelpful "%!w(<nil>)".
+func TestCreateWithNoZonesConfigured(t *testing.T) {
+	v, err := New(WithClient(http.DefaultClient))
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+	p.zones = nil
+
+	_, err = p.Create(context.TODO(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+	if err == nil {
+		t.Fatalf("expected an error when no zones are configured")
+	}
+	if strings.Contains(err.Error(), "<nil>") {
+		t.Errorf("expected a descriptive error, got %q", err.Error())
+	}
+}
+
+// TestCreateRetriesSameZoneOnRateLimit verifies that a 429 causes Create to
+// wait out the Retry-After duration and retry the same zone, rather than
+// immediately moving on to a different candidate (moving on wouldn't avoid
+// a project-level rate limit, and would only add more load while throttled).
+func TestCreateRetriesSameZoneOnRateLimit(t *testing.T) {
+	defer gock.Off()
+
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		JSON(insertInstanceMock).
+		Reply(429).
+		AddHeader("Retry-After", "0").
+		JSON(map[string]interface{}{
+			"error": map[string]interface{}{
+				"code":    429,
+				"message": "Too Many Requests",
+			},
+		})
+
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		JSON(insertInstanceMock).
+		Reply(200).
+		BodyString(`{ "name": "operation-name" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/operations/operation-name").
+		Reply(200).
+		BodyString(`{ "status": "DONE" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/instances/agent-807jvfwj").
+		Reply(200).
+		BodyString(`{ "networkInterfaces": [ { "accessConfigs": [ { "natIP": "1.2.3.4" } ] } ] }`)
+
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a"),
+		WithProject("my-project"),
+		WithUserData("#cloud-init"),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+	p.init.Do(func() {})
+
+	instance, err := p.Create(context.TODO(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+	if err != nil {
+		t.Fatalf("expected the same zone to be retried after the rate limit, got error: %v", err)
+	}
+	if want, got := instance.Region, "us-central1-a"; got != want {
+		t.Errorf("Want instance Region %q, got %q", want, got)
+	}
+}
+
+// TestCreateRespectsSearchTimeout verifies that Create gives up once
+// createSearchTimeout elapses instead of exhausting every zone/machine-type
+// combination, each with its own retry budget, against a persistently
+// failing backend.
+func TestCreateRespectsSearchTimeout(t *testing.T) {
+	defer gock.Off()
+
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		Persist().
+		Reply(503).
+		JSON(map[string]interface{}{
+			"error": map[string]interface{}{
+				"code":    503,
+				"message": "Service Unavailable",
+			},
+		})
+
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a"),
+		WithProject("my-project"),
+		WithUserData("#cloud-init"),
+		WithMachineType("n1-standard-4"),
+		WithMachineTypeAlt([]string{"n1-standard-2", "n1-standard-1"}),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+	p.init.Do(func() {})
+	p.createSearchTimeout = 50 * time.Millisecond
+
+	start := time.Now()
+	_, err = p.Create(context.TODO(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("expected an error once the search timeout elapses")
+	}
+	// generous upper bound: well under what exhausting 3 machine types'
+	// full 5-attempt retry budgets against a persistent 503 would take.
+	if elapsed > 2*time.Second {
+		t.Errorf("expected Create to give up close to createSearchTimeout, took %s", elapsed)
 	}
 }
 

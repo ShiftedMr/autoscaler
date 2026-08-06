@@ -66,6 +66,13 @@ func WithMachineType(size string) Option {
 	}
 }
 
+// WithMachineTypeAlt returns an option to set fallback instance types.
+func WithMachineTypeAlt(sizes []string) Option {
+	return func(p *provider) {
+		p.sizesAlt = sizes
+	}
+}
+
 // WithNetwork returns an option to set the network.
 func WithNetwork(network string) Option {
 	return func(p *provider) {

@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"sync"
 	"text/template"
@@ -51,12 +52,17 @@ type provider struct {
 	scopes              []string
 	serviceAccountEmail string
 	size                string
+	sizesAlt            []string
 	tags                []string
 	zones               []string
 	userdata            *template.Template
 	userdataKey         string
 
 	rateLimiter *rate.Limiter
+
+	// createSearchTimeout bounds how long Create spends cycling through
+	// zone/machine-type combinations; see the comment on Create for why.
+	createSearchTimeout time.Duration
 
 	service *compute.Service
 }
@@ -78,6 +84,9 @@ func New(opts ...Option) (autoscaler.Provider, error) {
 	}
 	if p.size == "" {
 		p.size = "n1-standard-1"
+	}
+	if p.createSearchTimeout == 0 {
+		p.createSearchTimeout = 5 * time.Minute
 	}
 	if p.image == "" {
 		p.image = "ubuntu-os-cloud/global/images/ubuntu-2004-focal-v20220712"
@@ -123,6 +132,32 @@ func New(opts ...Option) (autoscaler.Provider, error) {
 	return p, nil
 }
 
+// operationError preserves Google's structured Code/Message operation-error
+// fields instead of collapsing them to a plain string.
+type operationError struct {
+	Code    string
+	Message string
+}
+
+func (e *operationError) Error() string {
+	return e.Message
+}
+
+func (p *provider) sizes() []string {
+	return append([]string{p.size}, p.sizesAlt...)
+}
+
+// shuffledZones returns p.zones in random order, so repeated Create calls
+// don't all hammer the same zone first.
+func (p *provider) shuffledZones() []string {
+	zones := make([]string, len(p.zones))
+	copy(zones, p.zones)
+	rand.Shuffle(len(zones), func(i, j int) {
+		zones[i], zones[j] = zones[j], zones[i]
+	})
+	return zones
+}
+
 func (p *provider) waitZoneOperation(ctx context.Context, name string, zone string) error {
 	var op *compute.Operation
 	for {
@@ -157,7 +192,10 @@ func (p *provider) waitZoneOperation(ctx context.Context, name string, zone stri
 		}
 
 		if op.Error != nil && len(op.Error.Errors) > 0 {
-			return errors.New(op.Error.Errors[0].Message)
+			return &operationError{
+				Code:    op.Error.Errors[0].Code,
+				Message: op.Error.Errors[0].Message,
+			}
 		}
 		if op.Status == "DONE" {
 			return nil
@@ -202,7 +240,10 @@ func (p *provider) waitGlobalOperation(ctx context.Context, name string) error {
 		}
 
 		if op.Error != nil && len(op.Error.Errors) > 0 {
-			return errors.New(op.Error.Errors[0].Message)
+			return &operationError{
+				Code:    op.Error.Errors[0].Code,
+				Message: op.Error.Errors[0].Message,
+			}
 		}
 		if op.Status == "DONE" {
 			return nil

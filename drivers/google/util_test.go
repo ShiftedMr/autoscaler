@@ -1,6 +1,8 @@
 package google
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -82,6 +84,156 @@ func TestIsTransientError(t *testing.T) {
 			result := isTransientError(test.err)
 			if result != test.transient {
 				t.Errorf("isTransientError(%v) = %v, want %v", test.err, result, test.transient)
+			}
+		})
+	}
+}
+
+func TestIsStockoutError(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		stockout bool
+	}{
+		{
+			name:     "nil error",
+			err:      nil,
+			stockout: false,
+		},
+		{
+			name: "operation error with ZONE_RESOURCE_POOL_EXHAUSTED code",
+			err: &operationError{
+				Code:    "ZONE_RESOURCE_POOL_EXHAUSTED",
+				Message: "The zone does not have enough resources available",
+			},
+			stockout: true,
+		},
+		{
+			name: "operation error with STOCKOUT in message",
+			err: &operationError{
+				Code: "",
+				Message: "The zone 'projects/my-project/zones/us-central1-c' does not have enough resources " +
+					"available to fulfill the request.  'NULL:0/NULL:0/NULL:0 (state:STOCKOUT, sub-state:STOCKOUT, " +
+					"resource type:compute)'",
+			},
+			stockout: true,
+		},
+		{
+			name: "operation error unrelated",
+			err: &operationError{
+				Code:    "RESOURCE_NOT_FOUND",
+				Message: "The resource was not found",
+			},
+			stockout: false,
+		},
+		{
+			name: "googleapi error with ZONE_RESOURCE_POOL_EXHAUSTED reason",
+			err: &googleapi.Error{
+				Code: http.StatusBadRequest,
+				Errors: []googleapi.ErrorItem{
+					{Reason: "ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS"},
+				},
+			},
+			stockout: true,
+		},
+		{
+			name: "googleapi error with STOCKOUT in message",
+			err: &googleapi.Error{
+				Code:    http.StatusBadRequest,
+				Message: "state:STOCKOUT, sub-state:STOCKOUT",
+			},
+			stockout: true,
+		},
+		{
+			name: "googleapi error unrelated",
+			err: &googleapi.Error{
+				Code:    http.StatusForbidden,
+				Message: "insufficient permissions",
+			},
+			stockout: false,
+		},
+		{
+			// Google's shared error model also uses a bare "STOCKOUT" reason
+			// (e.g. on Spanner); check for it on Compute too in case a future
+			// response uses it instead of ZONE_RESOURCE_POOL_EXHAUSTED.
+			name: "googleapi error with STOCKOUT reason",
+			err: &googleapi.Error{
+				Code: http.StatusBadRequest,
+				Errors: []googleapi.ErrorItem{
+					{Reason: "STOCKOUT"},
+				},
+			},
+			stockout: true,
+		},
+		{
+			name: "googleapi error with STOCKOUT in a per-item message",
+			err: &googleapi.Error{
+				Code: http.StatusBadRequest,
+				Errors: []googleapi.ErrorItem{
+					{Message: "state:STOCKOUT, sub-state:STOCKOUT"},
+				},
+			},
+			stockout: true,
+		},
+		{
+			name: "operation error with RESOURCE_POOL_EXHAUSTED in message rather than code",
+			err: &operationError{
+				Code:    "",
+				Message: "ZONE_RESOURCE_POOL_EXHAUSTED: no capacity",
+			},
+			stockout: true,
+		},
+		{
+			// QUOTA_EXCEEDED is a project-level limit, not a (zone, size)
+			// capacity issue, and is deliberately not treated as a stockout.
+			name: "googleapi error with QUOTA_EXCEEDED reason is not a stockout",
+			err: &googleapi.Error{
+				Code: http.StatusForbidden,
+				Errors: []googleapi.ErrorItem{
+					{Reason: "QUOTA_EXCEEDED"},
+				},
+			},
+			stockout: false,
+		},
+		{
+			name: "operation error with QUOTA_EXCEEDED code is not a stockout",
+			err: &operationError{
+				Code:    "QUOTA_EXCEEDED",
+				Message: "Quota 'CPUS' exceeded",
+			},
+			stockout: false,
+		},
+		{
+			name:     "unrelated error type",
+			err:      errors.New("boom"),
+			stockout: false,
+		},
+		{
+			// errors.As (rather than a direct type assertion) means this still
+			// works if something wraps the underlying error with %w later.
+			name: "wrapped operation error with stockout code",
+			err: fmt.Errorf("instance insert operation failed: %w", &operationError{
+				Code: "ZONE_RESOURCE_POOL_EXHAUSTED",
+			}),
+			stockout: true,
+		},
+		{
+			name: "wrapped googleapi error with stockout reason",
+			err: fmt.Errorf("instance insert failed: %w", &googleapi.Error{
+				Code: http.StatusBadRequest,
+				Errors: []googleapi.ErrorItem{
+					{Reason: "ZONE_RESOURCE_POOL_EXHAUSTED"},
+				},
+			}),
+			stockout: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := isStockoutError(test.err)
+			if result != test.stockout {
+				t.Errorf("isStockoutError(%v) = %v, want %v", test.err, result, test.stockout)
 			}
 		})
 	}

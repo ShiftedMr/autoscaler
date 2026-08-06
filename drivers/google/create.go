@@ -9,8 +9,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/rand"
 	"strings"
+	"time"
 
 	"github.com/drone/autoscaler"
 	"github.com/drone/autoscaler/logger"
@@ -20,7 +20,73 @@ import (
 	"google.golang.org/api/googleapi"
 )
 
+// Create provisions an instance, trying every configured machine type across
+// every configured zone before giving up. createSearchTimeout bounds the
+// total time spent doing so: an async stockout is only discovered after
+// actually polling the zone operation for real wall-clock time, and that
+// cost multiplies by every (zone, size) combinatio.
 func (p *provider) Create(ctx context.Context, opts autoscaler.InstanceCreateOpts) (*autoscaler.Instance, error) {
+	ctx, cancel := context.WithTimeout(ctx, p.createSearchTimeout)
+	defer cancel()
+
+	err := errors.New("no machine types or zones configured")
+
+	// tryAllZones attempts size in every configured zone (random zone order),
+	// continuing past each possible error. A rate-limit response waits
+	// out the server-requested backoff and retries the same zone, since
+	// moving to a different zone won't avoid a project-level rate limit.
+	tryAllZones := func(size string) (*autoscaler.Instance, error) {
+		var instance *autoscaler.Instance
+		// Must stay non-nil: if p.zones is ever empty the loop below never
+		// runs, and this is what gets wrapped into the error Create
+		// ultimately returns. See TestCreateWithNoZonesConfigured.
+		err := fmt.Errorf("no zones configured for machine type %q", size)
+		for _, zone := range p.shuffledZones() {
+			for {
+				instance, err = p.createInZone(ctx, opts, zone, size)
+				if instance != nil {
+					return instance, err
+				}
+				rl, ok := err.(*retryAfterError)
+				if !ok {
+					break
+				}
+				logger.FromContext(ctx).
+					WithField("zone", zone).
+					WithField("size", size).
+					WithField("retryAfter", rl.retryAfter).
+					Infoln("rate limited, waiting before retrying the same zone")
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(rl.retryAfter):
+				}
+			}
+			if isStockoutError(err) {
+				logger.FromContext(ctx).
+					WithField("zone", zone).
+					WithField("size", size).
+					WithError(err).
+					Infoln("machine type unavailable in zone, trying next zone")
+			}
+		}
+		return nil, err
+	}
+
+	var instance *autoscaler.Instance
+	for _, size := range p.sizes() {
+		instance, err = tryAllZones(size)
+		if instance != nil {
+			return instance, err
+		}
+	}
+
+	return nil, fmt.Errorf("failed to create instance, all machine types and zones exhausted: %w", err)
+}
+
+// createInZone provisions a single instance of size in zone, without any
+// zone or machine-type fallback of its own; see Create for that.
+func (p *provider) createInZone(ctx context.Context, opts autoscaler.InstanceCreateOpts, zone string, size string) (*autoscaler.Instance, error) {
 	p.init.Do(func() {
 		p.setup(ctx)
 	})
@@ -33,13 +99,10 @@ func (p *provider) Create(ctx context.Context, opts autoscaler.InstanceCreateOpt
 
 	name := strings.ToLower(opts.Name)
 
-	// select random zone from the list
-	zone := p.zones[rand.Intn(len(p.zones))]
-
 	logger := logger.FromContext(ctx).
 		WithField("zone", zone).
 		WithField("image", p.image).
-		WithField("size", p.size).
+		WithField("size", size).
 		WithField("name", opts.Name)
 
 	logger.Debugln("instance insert")
@@ -58,7 +121,7 @@ func (p *provider) Create(ctx context.Context, opts autoscaler.InstanceCreateOpt
 		Name:           name,
 		Zone:           fmt.Sprintf("projects/%s/zones/%s", p.project, zone),
 		MinCpuPlatform: "Automatic",
-		MachineType:    fmt.Sprintf("projects/%s/zones/%s/machineTypes/%s", p.project, zone, p.size),
+		MachineType:    fmt.Sprintf("projects/%s/zones/%s/machineTypes/%s", p.project, zone, size),
 		Metadata: &compute.Metadata{
 			Items: []*compute.MetadataItems{
 				{
@@ -143,8 +206,14 @@ func (p *provider) Create(ctx context.Context, opts autoscaler.InstanceCreateOpt
 	// robust between insert calls / and be safe during autoscaler restarts.
 	err = p.waitZoneOperation(ctx, op.Name, zone)
 	if err != nil {
-		logger.WithError(err).
-			Errorln("instance insert operation failed")
+		entry := logger.WithError(err)
+		// operationError.Error() only renders Message;
+		// This will surface useful error codes like QUOTA_EXCEEDED
+		var opErr *operationError
+		if errors.As(err, &opErr) && opErr.Code != "" {
+			entry = entry.WithField("code", opErr.Code)
+		}
+		entry.Errorln("instance insert operation failed")
 		return nil, err
 	}
 
@@ -177,7 +246,7 @@ func (p *provider) Create(ctx context.Context, opts autoscaler.InstanceCreateOpt
 		Name:                opts.Name,
 		Image:               p.image,
 		Region:              zone,
-		Size:                p.size,
+		Size:                size,
 		Address:             address,
 		ServiceAccountEmail: p.serviceAccountEmail,
 		Scopes:              p.scopes,
