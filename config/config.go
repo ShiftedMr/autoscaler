@@ -163,7 +163,7 @@ type (
 
 		Google struct {
 			MachineType         string            `envconfig:"DRONE_GOOGLE_MACHINE_TYPE"`
-			MachineTypeAlt      []string          `envconfig:"DRONE_GOOGLE_MACHINE_TYPE_ALT"` // In the same manner as Amazon's InstanceAlt, allows fallback to other machine types if provisioning the primary type fails for any reason
+			MachineTypeAlt      []string          `envconfig:"DRONE_GOOGLE_MACHINE_TYPE_ALT"`
 			MachineImage        string            `envconfig:"DRONE_GOOGLE_MACHINE_IMAGE"`
 			Network             string            `envconfig:"DRONE_GOOGLE_NETWORK"`
 			Subnetwork          string            `envconfig:"DRONE_GOOGLE_SUBNETWORK"`
