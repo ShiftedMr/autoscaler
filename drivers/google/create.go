@@ -214,8 +214,14 @@ func (p *provider) createInZone(ctx context.Context, opts autoscaler.InstanceCre
 	// robust between insert calls / and be safe during autoscaler restarts.
 	err = p.waitZoneOperation(ctx, op.Name, zone)
 	if err != nil {
-		logger.WithError(err).
-			Errorln("instance insert operation failed")
+		entry := logger.WithError(err)
+		// operationError.Error() only renders Message; surface Code (e.g.
+		// "QUOTA_EXCEEDED") as a field too so it isn't lost from the log.
+		var opErr *operationError
+		if errors.As(err, &opErr) && opErr.Code != "" {
+			entry = entry.WithField("code", opErr.Code)
+		}
+		entry.Errorln("instance insert operation failed")
 		return nil, err
 	}
 

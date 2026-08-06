@@ -12,7 +12,10 @@ import (
 	"time"
 
 	"github.com/drone/autoscaler"
+	"github.com/drone/autoscaler/logger"
 	"github.com/h2non/gock"
+	"github.com/sirupsen/logrus"
+	logrustest "github.com/sirupsen/logrus/hooks/test"
 
 	"google.golang.org/api/compute/v1"
 	"google.golang.org/api/googleapi"
@@ -304,6 +307,69 @@ func TestCreateWithZoneOperationTransientError(t *testing.T) {
 	}
 	if want, got := instance.ID, "agent-807jvfwj"; got != want {
 		t.Errorf("Want instance ID %q, got %q", want, got)
+	}
+}
+
+// TestCreateLogsOperationErrorCode verifies that when a zone operation fails
+// with a structured Code (e.g. QUOTA_EXCEEDED), that code is still visible
+// in the log even though operationError.Error() only renders Message.
+func TestCreateLogsOperationErrorCode(t *testing.T) {
+	defer gock.Off()
+
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		JSON(insertInstanceMock).
+		Reply(200).
+		BodyString(`{ "name": "operation-name" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/operations/operation-name").
+		Reply(200).
+		JSON(map[string]interface{}{
+			"status": "DONE",
+			"error": map[string]interface{}{
+				"errors": []map[string]interface{}{
+					{
+						"code":    "QUOTA_EXCEEDED",
+						"message": "Quota 'CPUS' exceeded. Limit: 24.0 in region us-central1.",
+					},
+				},
+			},
+		})
+
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a"),
+		WithProject("my-project"),
+		WithUserData("#cloud-init"),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+	p.init.Do(func() {})
+
+	logrusLogger, hook := logrustest.NewNullLogger()
+	ctx := logger.WithContext(context.TODO(), logger.Logrus(logrus.NewEntry(logrusLogger)))
+
+	_, err = p.Create(ctx, autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+	if err == nil {
+		t.Fatalf("expected an error from the failed operation")
+	}
+
+	var found *logrus.Entry
+	for _, entry := range hook.AllEntries() {
+		if entry.Message == "instance insert operation failed" {
+			found = entry
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("expected an \"instance insert operation failed\" log entry, got entries: %v", hook.AllEntries())
+	}
+	if got, want := found.Data["code"], "QUOTA_EXCEEDED"; got != want {
+		t.Errorf("Want log field code %q, got %q", want, got)
 	}
 }
 
