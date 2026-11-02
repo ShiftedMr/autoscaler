@@ -6,11 +6,15 @@ package google
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/drone/autoscaler"
+	"github.com/drone/autoscaler/logger"
 	"github.com/h2non/gock"
+	"github.com/sirupsen/logrus"
 
 	"google.golang.org/api/compute/v1"
 	"google.golang.org/api/googleapi"
@@ -362,5 +366,204 @@ func TestCreateWithInsertTransientError(t *testing.T) {
 	}
 	if want, got := instance.ID, "agent-807jvfwj"; got != want {
 		t.Errorf("Want instance ID %q, got %q", want, got)
+	}
+}
+
+func newCreateTestProvider(t *testing.T) *provider {
+	t.Helper()
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a"),
+		WithProject("my-project"),
+		WithUserData("#cloud-init"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := v.(*provider)
+	p.init.Do(func() {})
+	p.maxTransientDelay = time.Millisecond
+	return p
+}
+
+func mockAcceptedInsert() {
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		Reply(200).
+		BodyString(`{ "name": "operation-name" }`)
+}
+
+// TestCreateReturnsInstanceWhenOperationPollTimesOut verifies that once
+// Google has accepted the insert, a poll that never reaches DONE before
+// createTimeout does not drop the VM: Create returns its identity alongside
+// the error, so the engine records it and the reaper can destroy it instead
+// of leaving it running untracked.
+func TestCreateReturnsInstanceWhenOperationPollTimesOut(t *testing.T) {
+	defer gock.Off()
+
+	mockAcceptedInsert()
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/operations/operation-name").
+		Persist().
+		Reply(200).
+		BodyString(`{ "status": "RUNNING" }`)
+
+	p := newCreateTestProvider(t)
+	p.createTimeout = 100 * time.Millisecond
+
+	logrusLogger, hook := newNullLogger()
+	ctx := logger.WithContext(context.Background(), logger.Logrus(logrus.NewEntry(logrusLogger)))
+
+	instance, err := p.Create(ctx, autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+
+	var unconfirmed *insertUnconfirmedError
+	if !errors.As(err, &unconfirmed) {
+		t.Fatalf("expected an *insertUnconfirmedError, got %v", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected the error to wrap context.DeadlineExceeded, got %v", err)
+	}
+	if instance == nil {
+		t.Fatal("expected the accepted instance to be returned alongside the error")
+	}
+	if want, got := "agent-807jvfwj", instance.ID; got != want {
+		t.Errorf("Want instance ID %q, got %q", want, got)
+	}
+	if want, got := "us-central1-a", instance.Region; got != want {
+		t.Errorf("Want instance Region %q, got %q", want, got)
+	}
+	var warned bool
+	for _, entry := range hook.AllEntries() {
+		if entry.Level == logrus.WarnLevel && entry.Message == "slow response from provider: the instance insert did not finish in time" {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Errorf("expected a slow-response warning, got %v", hook.AllEntries())
+	}
+}
+
+// TestCreateReturnsInstanceOnGetFailure verifies a failure reading the
+// instance back after a successful insert is also an unconfirmed outcome,
+// not a rejection.
+func TestCreateReturnsInstanceOnGetFailure(t *testing.T) {
+	defer gock.Off()
+
+	mockAcceptedInsert()
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/operations/operation-name").
+		Reply(200).
+		BodyString(`{ "status": "DONE" }`)
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/instances/agent-807jvfwj").
+		Reply(404)
+
+	p := newCreateTestProvider(t)
+
+	instance, err := p.Create(context.Background(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+
+	var unconfirmed *insertUnconfirmedError
+	if !errors.As(err, &unconfirmed) {
+		t.Fatalf("expected an *insertUnconfirmedError, got %v", err)
+	}
+	if instance == nil || instance.ID != "agent-807jvfwj" {
+		t.Fatalf("expected the accepted instance to be returned, got %+v", instance)
+	}
+}
+
+// TestCreateReturnsNoInstanceOnOperationError verifies a definitive failure -
+// the operation reached DONE with an error - returns no instance: nothing
+// was created, so there is nothing for the reaper to clean up.
+func TestCreateReturnsNoInstanceOnOperationError(t *testing.T) {
+	defer gock.Off()
+
+	mockAcceptedInsert()
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/operations/operation-name").
+		Reply(200).
+		JSON(map[string]interface{}{
+			"status": "DONE",
+			"error": map[string]interface{}{
+				"errors": []map[string]interface{}{
+					{
+						"code":    "ZONE_RESOURCE_POOL_EXHAUSTED",
+						"message": "The zone does not have enough resources available",
+					},
+				},
+			},
+		})
+
+	p := newCreateTestProvider(t)
+
+	instance, err := p.Create(context.Background(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+
+	var opErr *operationError
+	if !errors.As(err, &opErr) {
+		t.Fatalf("expected an *operationError, got %v", err)
+	}
+	if got, want := opErr.Code, "ZONE_RESOURCE_POOL_EXHAUSTED"; got != want {
+		t.Errorf("Want error code %q, got %q", want, got)
+	}
+	var unconfirmed *insertUnconfirmedError
+	if errors.As(err, &unconfirmed) {
+		t.Errorf("a definitive operation error is not an unconfirmed insert")
+	}
+	if instance != nil {
+		t.Errorf("expected no instance when the operation failed, got %+v", instance)
+	}
+}
+
+// TestCreateReturnsNoInstanceWhenInsertRejected verifies an insert Google
+// rejects outright returns no instance.
+func TestCreateReturnsNoInstanceWhenInsertRejected(t *testing.T) {
+	defer gock.Off()
+
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		Reply(400).
+		JSON(map[string]interface{}{
+			"error": map[string]interface{}{"code": 400, "message": "Invalid value for field 'machineType'"},
+		})
+
+	p := newCreateTestProvider(t)
+
+	instance, err := p.Create(context.Background(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	var unconfirmed *insertUnconfirmedError
+	if errors.As(err, &unconfirmed) {
+		t.Errorf("a rejected insert is not an unconfirmed insert")
+	}
+	if instance != nil {
+		t.Errorf("expected no instance, got %+v", instance)
+	}
+}
+
+// TestCreateTimeoutBoundsTheInsertRequestItself verifies createTimeout also
+// covers asking Google to insert. Nothing was accepted, so no instance is
+// returned.
+func TestCreateTimeoutBoundsTheInsertRequestItself(t *testing.T) {
+	defer gock.Off()
+
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		Reply(200).
+		Delay(2 * time.Second).
+		BodyString(`{ "name": "operation-name" }`)
+
+	p := newCreateTestProvider(t)
+	p.createTimeout = 50 * time.Millisecond
+
+	start := time.Now()
+	instance, err := p.Create(context.Background(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+	if err == nil {
+		t.Fatal("expected an error when the insert outlasts createTimeout")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("expected Create to give up near createTimeout (50ms), took %s", elapsed)
+	}
+	if instance != nil {
+		t.Errorf("expected no instance when the insert was never accepted, got %+v", instance)
 	}
 }

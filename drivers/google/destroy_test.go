@@ -6,11 +6,15 @@ package google
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/drone/autoscaler"
+	"github.com/drone/autoscaler/logger"
 	"github.com/h2non/gock"
+	"github.com/sirupsen/logrus"
 )
 
 func TestDestroy(t *testing.T) {
@@ -74,5 +78,283 @@ func TestDestroy_Error(t *testing.T) {
 	err = p.Destroy(mockContext, mockInstance)
 	if err == nil {
 		t.Errorf("Expect error deleting server")
+	}
+}
+
+func newDestroyTestProvider(t *testing.T) *provider {
+	t.Helper()
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a"),
+		WithProject("my-project"),
+		WithRateLimit(1000),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v.(*provider)
+}
+
+var destroyTestInstance = &autoscaler.Instance{
+	ID:     "my-instance",
+	Name:   "my-instance",
+	Region: "us-central1-a",
+}
+
+func countUnableToConfirm(hook *logHook) (n int) {
+	for _, entry := range hook.AllEntries() {
+		if entry.Level == logrus.WarnLevel && entry.Message == "delete was accepted but unable to confirm the instance was deleted" {
+			n++
+		}
+	}
+	return n
+}
+
+func countDeleteOperationFailed(hook *logHook) (n int) {
+	for _, entry := range hook.AllEntries() {
+		if entry.Level == logrus.ErrorLevel && entry.Message == "delete operation failed" {
+			n++
+		}
+	}
+	return n
+}
+
+// TestDestroyGivesUpAfterDestroyTimeout verifies Destroy doesn't poll a
+// delete operation forever if it never reaches a terminal state, and logs
+// that it couldn't confirm the deletion.
+func TestDestroyGivesUpAfterDestroyTimeout(t *testing.T) {
+	defer gock.Off()
+
+	gock.New("https://compute.googleapis.com").
+		Delete("/compute/v1/projects/my-project/zones/us-central1-a/instances/my-instance").
+		Reply(200).
+		BodyString(`{ "name": "operation-name" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/operations/operation-name").
+		Persist().
+		Reply(200).
+		BodyString(`{ "status": "RUNNING" }`)
+
+	p := newDestroyTestProvider(t)
+	p.destroyTimeout = 50 * time.Millisecond
+
+	logrusLogger, hook := newNullLogger()
+	ctx := logger.WithContext(context.Background(), logger.Logrus(logrus.NewEntry(logrusLogger)))
+
+	err := p.Destroy(ctx, destroyTestInstance)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected a context.DeadlineExceeded error once destroyTimeout elapses, got %v", err)
+	}
+	if got := countUnableToConfirm(hook); got != 1 {
+		t.Errorf("expected exactly one \"unable to confirm\" warning, got %d (entries: %v)", got, hook.AllEntries())
+	}
+}
+
+// TestDestroyRetriesTransientErrorOnDeleteRequest verifies the delete
+// request itself, like Insert, retries a transient 5xx rather than failing
+// immediately - safe without Insert's RequestId protection against duplicate
+// creation, since a repeat Delete on an instance already gone just 404s.
+func TestDestroyRetriesTransientErrorOnDeleteRequest(t *testing.T) {
+	defer gock.Off()
+
+	gock.New("https://compute.googleapis.com").
+		Delete("/compute/v1/projects/my-project/zones/us-central1-a/instances/my-instance").
+		Reply(503).
+		JSON(map[string]interface{}{
+			"error": map[string]interface{}{"code": 503, "message": "Service Unavailable"},
+		})
+
+	gock.New("https://compute.googleapis.com").
+		Delete("/compute/v1/projects/my-project/zones/us-central1-a/instances/my-instance").
+		Reply(200).
+		BodyString(`{ "name": "operation-name" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/operations/operation-name").
+		Reply(200).
+		BodyString(`{ "status": "DONE" }`)
+
+	p := newDestroyTestProvider(t)
+
+	if err := p.Destroy(context.Background(), destroyTestInstance); err != nil {
+		t.Fatalf("expected Destroy to succeed after retrying the transient 503, got %v", err)
+	}
+	if !gock.IsDone() {
+		t.Errorf("expected both delete attempts and the operation poll to be consumed")
+	}
+}
+
+// TestDestroyReturnsInstanceNotFoundWhenAlreadyGone verifies the 404 mapping
+// survives the timeout wrapper, since the engine treats it as success rather
+// than an error to retry.
+func TestDestroyReturnsInstanceNotFoundWhenAlreadyGone(t *testing.T) {
+	defer gock.Off()
+
+	gock.New("https://compute.googleapis.com").
+		Delete("/compute/v1/projects/my-project/zones/us-central1-a/instances/my-instance").
+		Reply(404)
+
+	p := newDestroyTestProvider(t)
+
+	logrusLogger, hook := newNullLogger()
+	ctx := logger.WithContext(context.Background(), logger.Logrus(logrus.NewEntry(logrusLogger)))
+
+	if err := p.Destroy(ctx, destroyTestInstance); err != autoscaler.ErrInstanceNotFound {
+		t.Fatalf("expected ErrInstanceNotFound, got %v", err)
+	}
+	if got := countUnableToConfirm(hook); got != 0 {
+		t.Errorf("a missing instance is a confirmed outcome, expected no \"unable to confirm\" warning, got %d", got)
+	}
+}
+
+// TestDestroyReturnsInstanceNotFoundWhenPollReturns404 verifies the 404
+// mapping also applies to the operation poll, not just the initial delete
+// request - e.g. a reaper retry racing an earlier attempt whose delete
+// already completed, so ZoneOperations.Get 404s on the (now-gone)
+// operation name.
+func TestDestroyReturnsInstanceNotFoundWhenPollReturns404(t *testing.T) {
+	defer gock.Off()
+
+	gock.New("https://compute.googleapis.com").
+		Delete("/compute/v1/projects/my-project/zones/us-central1-a/instances/my-instance").
+		Reply(200).
+		BodyString(`{ "name": "operation-name" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/operations/operation-name").
+		Reply(404)
+
+	p := newDestroyTestProvider(t)
+
+	logrusLogger, hook := newNullLogger()
+	ctx := logger.WithContext(context.Background(), logger.Logrus(logrus.NewEntry(logrusLogger)))
+
+	if err := p.Destroy(ctx, destroyTestInstance); err != autoscaler.ErrInstanceNotFound {
+		t.Fatalf("expected ErrInstanceNotFound, got %v", err)
+	}
+	if got := countUnableToConfirm(hook); got != 0 {
+		t.Errorf("a 404 mid-poll is a confirmed outcome, expected no \"unable to confirm\" warning, got %d", got)
+	}
+}
+
+// TestDestroyStopsPollingWhenParentContextIsCancelled verifies that if the
+// caller's own ctx is cancelled (e.g. engine shutdown, which cancels the
+// root ctx the reaper passes - see engine/reaper.go) while Destroy is
+// polling, Destroy returns promptly rather than continuing until
+// destroyTimeout elapses.
+func TestDestroyStopsPollingWhenParentContextIsCancelled(t *testing.T) {
+	defer gock.Off()
+
+	gock.New("https://compute.googleapis.com").
+		Delete("/compute/v1/projects/my-project/zones/us-central1-a/instances/my-instance").
+		Reply(200).
+		BodyString(`{ "name": "operation-name" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/operations/operation-name").
+		Persist().
+		Reply(200).
+		BodyString(`{ "status": "RUNNING" }`)
+
+	p := newDestroyTestProvider(t)
+	// Long enough that only the cancellation, not destroyTimeout, should
+	// stop this.
+	p.destroyTimeout = time.Minute
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	err := p.Destroy(ctx, destroyTestInstance)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled once the parent ctx is cancelled, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Errorf("expected Destroy to stop promptly after cancellation, took %s", elapsed)
+	}
+}
+
+// TestDestroyLogsOperationErrorAsError verifies a definitive operation
+// failure (Google rejected the delete, not just "couldn't confirm") is
+// logged at Error with the operation's code, distinct from the Warn-level
+// "unable to confirm" case used for ambiguous/poll-failure outcomes.
+func TestDestroyLogsOperationErrorAsError(t *testing.T) {
+	defer gock.Off()
+
+	gock.New("https://compute.googleapis.com").
+		Delete("/compute/v1/projects/my-project/zones/us-central1-a/instances/my-instance").
+		Reply(200).
+		BodyString(`{ "name": "operation-name" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/operations/operation-name").
+		Reply(200).
+		JSON(map[string]interface{}{
+			"status": "DONE",
+			"error": map[string]interface{}{
+				"errors": []map[string]interface{}{
+					{
+						"code":    "RESOURCE_OPERATION_RATE_EXCEEDED",
+						"message": "delete rejected",
+					},
+				},
+			},
+		})
+
+	p := newDestroyTestProvider(t)
+
+	logrusLogger, hook := newNullLogger()
+	ctx := logger.WithContext(context.Background(), logger.Logrus(logrus.NewEntry(logrusLogger)))
+
+	var opErr *operationError
+	if err := p.Destroy(ctx, destroyTestInstance); !errors.As(err, &opErr) {
+		t.Fatalf("expected Destroy to return the operation error, got %v", err)
+	}
+	if got := countDeleteOperationFailed(hook); got != 1 {
+		t.Errorf("expected exactly one \"delete operation failed\" error, got %d (entries: %v)", got, hook.AllEntries())
+	}
+	if got := countUnableToConfirm(hook); got != 0 {
+		t.Errorf("a definitive operation error is not an \"unable to confirm\" case, got %d", got)
+	}
+	for _, entry := range hook.AllEntries() {
+		if entry.Message == "delete operation failed" && entry.Data["code"] != "RESOURCE_OPERATION_RATE_EXCEEDED" {
+			t.Errorf("expected the operation's code to be logged, got %v", entry.Data["code"])
+		}
+	}
+}
+
+// TestDestroyTimeoutAppliesToTheDeleteRequestItself verifies destroyTimeout
+// also covers asking Google to delete, not just waiting on the operation.
+// That failure is not an "unable to confirm" case - nothing was accepted - so
+// it must not log as one; it just returns the error for the reaper to retry.
+func TestDestroyTimeoutAppliesToTheDeleteRequestItself(t *testing.T) {
+	defer gock.Off()
+
+	gock.New("https://compute.googleapis.com").
+		Delete("/compute/v1/projects/my-project/zones/us-central1-a/instances/my-instance").
+		Reply(200).
+		Delay(2 * time.Second).
+		BodyString(`{ "name": "operation-name" }`)
+
+	p := newDestroyTestProvider(t)
+	p.destroyTimeout = 50 * time.Millisecond
+
+	logrusLogger, hook := newNullLogger()
+	ctx := logger.WithContext(context.Background(), logger.Logrus(logrus.NewEntry(logrusLogger)))
+
+	start := time.Now()
+	err := p.Destroy(ctx, destroyTestInstance)
+	if err == nil {
+		t.Fatalf("expected an error when the delete request outlasts destroyTimeout")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("expected Destroy to give up near destroyTimeout (50ms), took %s", elapsed)
+	}
+	if got := countUnableToConfirm(hook); got != 0 {
+		t.Errorf("expected no \"unable to confirm\" warning when the delete was never accepted, got %d", got)
 	}
 }
