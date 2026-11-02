@@ -38,9 +38,19 @@ An operation that reaches `DONE` with an error is definitive: nothing was create
 
 Transient errors (408, 500, 502, 503, 504) are retried with a capped exponential backoff. A rate limit, either a 429 or a 403 with reason `rateLimitExceeded`, is retried after the server's `Retry-After` (10 seconds if it sends none).
 
+## Shared rate-limit coordination
+
+One provider serves every concurrent `Create` and `Destroy`, and a rate limit applies to the whole project or region, not to one call. So the provider keeps shared state, so that calls do not each rediscover the same limit:
+
+- A rate-limit response, from an insert, a delete or an operation poll, records a shared backoff window that honors the server's `Retry-After`.
+- While a window is active, `Create` calls queue for a turn in FIFO order, and only one attempts at a time.
+- A call does not start a wait that would outlast its own deadline. It gives up with a clear "rate limited" error instead of timing out opaquely.
+- Consecutive rate-limit hits without an intervening wait, and rate-limit hits while polling a single operation, are each capped (5), after which the call gives up on that attempt or operation.
+- `Destroy` publishes its rate-limit hits into the window but is never paced by it.
+
 ## Timeouts
 
-- **Create** (`DRONE_GOOGLE_SERVER_CREATE_TIMEOUT`): bounds the whole call, from the insert through its operation poll and the follow-up read.
+- **Create** (`DRONE_GOOGLE_SERVER_CREATE_TIMEOUT`): bounds one attempt, from the insert through its operation poll and the follow-up read, and also the whole call, including any time spent waiting for a rate-limit turn (see above). Waiting does not count against the attempt itself.
 - **Destroy**: bounded to 15 minutes, covering both the delete request and waiting for the delete operation.
 
 Choose the create timeout above what a slow-but-successful creation takes. A timeout that fires after Google accepted the insert leaves an instance that may still come up, and that instance is then cleaned up (see below), so too low a value turns working creations into failures.
@@ -69,3 +79,4 @@ The engine records the server as errored along with its ID, and the reaper then 
 - A slow response, where the create timeout elapsed before the insert finished, logs at Warn.
 - A failed insert operation, a failed read-back, and a failed delete operation log at Error.
 - A delete that was accepted but could not be confirmed logs at Warn.
+- Waiting for a rate-limit turn, and giving up on one, log at Info.

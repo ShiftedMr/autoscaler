@@ -15,6 +15,7 @@ import (
 
 	"github.com/drone/autoscaler"
 	"github.com/drone/autoscaler/drivers/internal/userdata"
+	"github.com/drone/autoscaler/logger"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"golang.org/x/time/rate"
@@ -71,6 +72,11 @@ type provider struct {
 	// server's Retry-After instead).
 	maxTransientDelay time.Duration
 
+	// rateLimit is the shared rate-limit backoff window and turn-claim
+	// state coordinated across every concurrent Create and Destroy call
+	// against this provider. See ratelimit.go for more information.
+	rateLimit rateLimitState
+
 	service *compute.Service
 }
 
@@ -126,6 +132,8 @@ func New(opts ...Option) (autoscaler.Provider, error) {
 		p.serviceAccountEmail = "default"
 	}
 
+	p.rateLimit.init()
+
 	if p.rateLimiter == nil {
 		// If unspecified, set to the max read rate limit for the API 25/s
 		// Source: https://cloud.google.com/compute/docs/api-rate-limits
@@ -157,15 +165,37 @@ func (e *operationError) Error() string {
 }
 
 // waitOperation polls a compute operation until it is DONE, returning its
-// error (if any) only then, or until ctx ends. get performs one poll; it is
-// shared by waitZoneOperation and waitGlobalOperation, which differ only in
-// the API call they make.
-func (p *provider) waitOperation(ctx context.Context, get func() (*compute.Operation, error)) error {
+// error (if any) only then, or until ctx ends. get performs one poll; label
+// names the operation in logs. It is shared by waitZoneOperation and
+// waitGlobalOperation, which differ only in the API call they make.
+//
+// A rate limit hit here is recorded into the shared window (see
+// recordRateLimit), but this function does not itself wait for or claim a
+// turn via waitForRateLimitTurn - that's left to the caller. It gives up
+// after maxOperationRetries consecutive rate limits, since some callers (the
+// reaper's Destroy path) pass a ctx with no deadline of their own.
+func (p *provider) waitOperation(ctx context.Context, label string, get func() (*compute.Operation, error)) error {
+	rateLimitHits := 0
 	for {
 		op, err := get()
 		if err != nil {
 			var rl *retryAfterError
 			if errors.As(err, &rl) {
+				rateLimitHits++
+				// Recorded before sleeping, so the shared window is already
+				// extended by the time another goroutine can observe it as
+				// clear (same ordering rationale as attemptInZone).
+				p.recordRateLimit(rl.retryAfter)
+				if rateLimitHits > p.rateLimit.maxOperationRetries {
+					logger.FromContext(ctx).
+						WithField("operation", label).
+						WithField("hits", rateLimitHits).
+						Infoln("rate limited, giving up on this operation - hit the limit too many times in a row")
+					return fmt.Errorf("rate limited: hit the limit %d times in a row polling %s - giving up: %w", rateLimitHits, label, rl)
+				}
+				if err := waitUntilFits(ctx, rl.retryAfter); err != nil {
+					return err
+				}
 				if err := sleepOrDone(ctx, rl.retryAfter); err != nil {
 					return err
 				}
@@ -196,9 +226,10 @@ func (p *provider) waitOperation(ctx context.Context, get func() (*compute.Opera
 }
 
 func (p *provider) waitZoneOperation(ctx context.Context, name string, zone string) error {
-	return p.waitOperation(ctx, func() (*compute.Operation, error) {
+	label := fmt.Sprintf("zone operations.get %s", name)
+	return p.waitOperation(ctx, label, func() (*compute.Operation, error) {
 		var op *compute.Operation
-		err := doWithRetry(ctx, fmt.Sprintf("zone operations.get %s", name), p.maxTransientDelay, func() error {
+		err := doWithRetry(ctx, label, p.maxTransientDelay, func() error {
 			if err := p.rateLimiter.Wait(ctx); err != nil {
 				return err
 			}
@@ -221,9 +252,10 @@ func (p *provider) waitZoneOperation(ctx context.Context, name string, zone stri
 }
 
 func (p *provider) waitGlobalOperation(ctx context.Context, name string) error {
-	return p.waitOperation(ctx, func() (*compute.Operation, error) {
+	label := fmt.Sprintf("global operations.get %s", name)
+	return p.waitOperation(ctx, label, func() (*compute.Operation, error) {
 		var op *compute.Operation
-		err := doWithRetry(ctx, fmt.Sprintf("global operations.get %s", name), p.maxTransientDelay, func() error {
+		err := doWithRetry(ctx, label, p.maxTransientDelay, func() error {
 			if err := p.rateLimiter.Wait(ctx); err != nil {
 				return err
 			}
