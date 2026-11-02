@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -565,5 +566,513 @@ func TestCreateTimeoutBoundsTheInsertRequestItself(t *testing.T) {
 	}
 	if instance != nil {
 		t.Errorf("expected no instance when the insert was never accepted, got %+v", instance)
+	}
+}
+
+// TestCreateRetriesSameZoneOnRateLimit verifies that a 429 causes Create to
+// wait out the Retry-After duration and retry the same zone, rather than
+// immediately moving on to a different candidate (moving on wouldn't avoid
+// a project-level rate limit, and would only add more load while throttled).
+// TestCreateWaitsOutRateLimitAsSoleWaiter verifies that, as the only Create
+// call currently running, a 429 is waited out and retried against the same
+// zone (succeeding once it clears) rather than moving on to another
+// candidate: every candidate shares the same project/region-wide limit, so
+// trying another one wouldn't avoid it and would only add more load to an
+// already rate-limited quota.
+func TestCreateWaitsOutRateLimitAsSoleWaiter(t *testing.T) {
+	defer gock.Off()
+
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		Reply(429).
+		AddHeader("Retry-After", "0").
+		JSON(map[string]interface{}{
+			"error": map[string]interface{}{
+				"code":    429,
+				"message": "Too Many Requests",
+			},
+		})
+
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		Reply(200).
+		BodyString(`{ "name": "operation-name" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/operations/operation-name").
+		Reply(200).
+		BodyString(`{ "status": "DONE" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/instances/agent-807jvfwj").
+		Reply(200).
+		BodyString(`{ "networkInterfaces": [ { "accessConfigs": [ { "natIP": "1.2.3.4" } ] } ] }`)
+
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a"),
+		WithProject("my-project"),
+		WithUserData("#cloud-init"),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+	p.init.Do(func() {})
+
+	instance, err := p.Create(context.TODO(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+	if err != nil {
+		t.Fatalf("expected the sole waiter to succeed after retrying, got error: %v", err)
+	}
+	if want, got := instance.Region, "us-central1-a"; got != want {
+		t.Errorf("Want instance Region %q, got %q", want, got)
+	}
+	if p.rateLimitTurnHeld() {
+		t.Errorf("expected the wait claim to be released after succeeding")
+	}
+}
+
+// TestCreateReleasesRateLimitWaitOnPanic verifies that a panic inside
+// createInZone - while this call is holding the rate-limit turn - still
+// releases it, rather than leaving the turn stuck claimed and wedging
+// every other Create call on this provider that ever needs to wait for one
+// again. Triggers a real panic via the (pre-existing, unrelated to this
+// mechanism) unchecked NetworkInterfaces[0] indexing in createInZone, by
+// having instances.Get return no network interfaces at all.
+//
+// Uses a real (non-zero) Retry-After so the retry actually goes through
+// waitForRateLimitTurn and claims the turn before the panicking attempt -
+// a "Retry-After: 0" would leave the window already expired by the very
+// next check, so the claim path (and thus the bug this test guards) would
+// never be exercised at all.
+func TestCreateReleasesRateLimitWaitOnPanic(t *testing.T) {
+	defer gock.Off()
+
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		Reply(429).
+		AddHeader("Retry-After", "1").
+		JSON(map[string]interface{}{
+			"error": map[string]interface{}{
+				"code":    429,
+				"message": "Too Many Requests",
+			},
+		})
+
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		Reply(200).
+		BodyString(`{ "name": "operation-name" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/operations/operation-name").
+		Reply(200).
+		BodyString(`{ "status": "DONE" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/instances/agent-807jvfwj").
+		Reply(200).
+		BodyString(`{ "networkInterfaces": [] }`)
+
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a"),
+		WithProject("my-project"),
+		WithUserData("#cloud-init"),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+	p.init.Do(func() {})
+
+	panicked := func() (didPanic bool) {
+		defer func() {
+			if recover() != nil {
+				didPanic = true
+			}
+		}()
+		p.Create(context.TODO(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+		return false
+	}()
+
+	if !panicked {
+		t.Fatalf("expected createInZone's empty NetworkInterfaces indexing to panic")
+	}
+	if p.rateLimitTurnHeld() {
+		t.Errorf("expected the wait claim to be released even though createInZone panicked")
+	}
+}
+
+// TestCreateWaitsOutWriteQuotaExceededAsSoleWaiter is the same as
+// TestCreateWaitsOutRateLimitAsSoleWaiter but for the 403 write-quota-
+// exceeded shape Compute actually returns for an exhausted
+// per-project-per-region quota (seen in production logs), which
+// isRateLimitError also recognizes.
+func TestCreateWaitsOutWriteQuotaExceededAsSoleWaiter(t *testing.T) {
+	defer gock.Off()
+
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		Reply(403).
+		AddHeader("Retry-After", "0").
+		JSON(map[string]interface{}{
+			"error": map[string]interface{}{
+				"code":    403,
+				"message": "Quota exceeded for quota metric 'Write requests' and limit 'Write requests per minute per region' of service 'compute.googleapis.com' for consumer 'project_number:635500232573'.",
+				"errors": []map[string]interface{}{
+					{
+						"reason":  "rateLimitExceeded",
+						"message": "Quota exceeded for quota metric 'Write requests' and limit 'Write requests per minute per region' of service 'compute.googleapis.com' for consumer 'project_number:635500232573'.",
+					},
+				},
+			},
+		})
+
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		Reply(200).
+		BodyString(`{ "name": "operation-name" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/operations/operation-name").
+		Reply(200).
+		BodyString(`{ "status": "DONE" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/instances/agent-807jvfwj").
+		Reply(200).
+		BodyString(`{ "networkInterfaces": [ { "accessConfigs": [ { "natIP": "1.2.3.4" } ] } ] }`)
+
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a"),
+		WithProject("my-project"),
+		WithUserData("#cloud-init"),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+	p.init.Do(func() {})
+
+	instance, err := p.Create(context.TODO(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+	if err != nil {
+		t.Fatalf("expected the sole waiter to succeed after retrying, got error: %v", err)
+	}
+	if want, got := instance.Region, "us-central1-a"; got != want {
+		t.Errorf("Want instance Region %q, got %q", want, got)
+	}
+}
+
+// TestCreateGivesUpWaitingWhenItWouldOutlastTheSearch verifies that the
+// sole waiter doesn't start a wait it can't finish: if the shared backoff
+// window is longer than createTimeout has left, it abandons the
+// search immediately with a clear "rate limited" error instead of waiting
+// into an opaque context deadline exceeded.
+func TestCreateGivesUpWaitingWhenItWouldOutlastTheSearch(t *testing.T) {
+	defer gock.Off()
+
+	// Only one attempt should ever happen: Create must give up as soon as
+	// it sees the wait is unwinnable, not retry after waiting anyway.
+	// gock.IsDone() below fails clearly if a second attempt happened
+	// instead (the default matcher only matches once).
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		Reply(429).
+		AddHeader("Retry-After", "3600").
+		JSON(map[string]interface{}{
+			"error": map[string]interface{}{
+				"code":    429,
+				"message": "Too Many Requests",
+			},
+		})
+
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a"),
+		WithProject("my-project"),
+		WithUserData("#cloud-init"),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+	p.init.Do(func() {})
+	// Far shorter than the 1-hour Retry-After above, so the wait is
+	// guaranteed to be judged as longer than the search has left.
+	p.createTimeout = time.Second
+
+	start := time.Now()
+	_, err = p.Create(context.TODO(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("expected Create to give up and return an error")
+	}
+	if !strings.Contains(err.Error(), "rate limited") {
+		t.Errorf("expected a rate-limited error, got: %v", err)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("expected an immediate return with no wait since the backoff outlasts the search, took %s", elapsed)
+	}
+	if !gock.IsDone() {
+		t.Errorf("expected exactly one attempt - no retry once the wait is judged unwinnable")
+	}
+	if p.rateLimitTurnHeld() {
+		t.Errorf("expected the wait claim to be released after giving up")
+	}
+}
+
+// TestCreateGivesUpWaitingAfterMaxRateLimitWaitRetries verifies that the
+// sole waiter doesn't wait forever: once rateLimitState.maxWaitRetries is
+// exhausted, it abandons the search like any other call would instead of
+// continuing to retry.
+func TestCreateGivesUpWaitingAfterMaxRateLimitWaitRetries(t *testing.T) {
+	defer gock.Off()
+
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a"),
+		WithProject("my-project"),
+		WithUserData("#cloud-init"),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+	p.init.Do(func() {})
+
+	// The initial attempt plus rateLimitState.maxWaitRetries retries, all 429s -
+	// exactly this many, so gock.IsDone() below proves Create stopped
+	// retrying instead of waiting indefinitely.
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		Times(p.rateLimit.maxWaitRetries+1).
+		Reply(429).
+		AddHeader("Retry-After", "0").
+		JSON(map[string]interface{}{
+			"error": map[string]interface{}{
+				"code":    429,
+				"message": "Too Many Requests",
+			},
+		})
+
+	_, err = p.Create(context.TODO(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+	if err == nil {
+		t.Fatalf("expected Create to give up and return an error")
+	}
+	if !gock.IsDone() {
+		t.Errorf("expected exactly rateLimitState.maxWaitRetries+1 attempts, got a different count")
+	}
+	if p.rateLimitTurnHeld() {
+		t.Errorf("expected the wait claim to be released after giving up")
+	}
+}
+
+// TestCreateDoesNotGiveUpAfterManyPacedRateLimitHits verifies that a call
+// genuinely waiting out real, repeated rate limits - each one properly
+// paced via waitForRateLimitTurn - doesn't give up early just because the
+// total hit count exceeds rateLimitState.maxWaitRetries: that cap only counts
+// consecutive hits without a wait in between (see the comment on it), not
+// every hit outright. Uses a real Retry-After (parseRetryAfter only parses
+// whole seconds) so each hit is a genuine paced wait, not an instant
+// bypass of waitForRateLimitTurn.
+func TestCreateDoesNotGiveUpAfterManyPacedRateLimitHits(t *testing.T) {
+	defer gock.Off()
+
+	// 3 paced hits - more than rateLimitState.maxWaitRetries(2) - then success.
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		Times(3).
+		Reply(429).
+		AddHeader("Retry-After", "1").
+		JSON(map[string]interface{}{
+			"error": map[string]interface{}{
+				"code":    429,
+				"message": "Too Many Requests",
+			},
+		})
+
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		Reply(200).
+		BodyString(`{ "name": "operation-name" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/operations/operation-name").
+		Reply(200).
+		BodyString(`{ "status": "DONE" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/instances/agent-807jvfwj").
+		Reply(200).
+		BodyString(`{ "networkInterfaces": [ { "accessConfigs": [ { "natIP": "1.2.3.4" } ] } ] }`)
+
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a"),
+		WithProject("my-project"),
+		WithUserData("#cloud-init"),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+	p.init.Do(func() {})
+	p.rateLimit.maxWaitRetries = 2
+
+	instance, err := p.Create(context.TODO(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+	if err != nil {
+		t.Fatalf("expected Create to succeed despite 3 hits exceeding rateLimitState.maxWaitRetries(2), since each was properly paced, got error: %v", err)
+	}
+	if want, got := instance.Region, "us-central1-a"; got != want {
+		t.Errorf("Want instance Region %q, got %q", want, got)
+	}
+	if !gock.IsDone() {
+		t.Errorf("expected every registered mock to be consumed")
+	}
+}
+
+// TestCreateSkipsEntirelyWhenAlreadyRateLimited verifies that, if the
+// shared backoff window is already in effect (set by a concurrent or
+// preceding Create call), a new Create call fails immediately without
+// attempting any API call at all.
+func TestCreateSkipsEntirelyWhenAlreadyRateLimited(t *testing.T) {
+	defer gock.Off()
+
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a"),
+		WithProject("my-project"),
+		WithUserData("#cloud-init"),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+	p.init.Do(func() {})
+	p.createTimeout = 10 * time.Millisecond
+	p.recordRateLimit(time.Hour)
+
+	start := time.Now()
+	_, err = p.Create(context.TODO(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("expected Create to give up and return an error")
+	}
+	if !strings.Contains(err.Error(), "rate limited") {
+		t.Errorf("expected a rate-limited error, got: %v", err)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("expected an immediate return since the wait is judged unwinnable up front, took %s", elapsed)
+	}
+}
+
+// TestCreateWaitsItsTurnWhenAlreadyRateLimitedAtStart verifies that, if the
+// shared backoff window is already in effect when Create starts (set by a
+// concurrent or preceding call) but is short enough to fit within
+// createTimeout, Create waits it out and still attempts normally
+// once it clears - rather than failing immediately just because a window
+// happened to already be active.
+func TestCreateWaitsItsTurnWhenAlreadyRateLimitedAtStart(t *testing.T) {
+	defer gock.Off()
+
+	gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		Reply(200).
+		BodyString(`{ "name": "operation-name" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/operations/operation-name").
+		Reply(200).
+		BodyString(`{ "status": "DONE" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/instances/agent-807jvfwj").
+		Reply(200).
+		BodyString(`{ "networkInterfaces": [ { "accessConfigs": [ { "natIP": "1.2.3.4" } ] } ] }`)
+
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithZones("us-central1-a"),
+		WithProject("my-project"),
+		WithUserData("#cloud-init"),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+	p.init.Do(func() {})
+	p.recordRateLimit(10 * time.Millisecond)
+
+	instance, err := p.Create(context.TODO(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+	if err != nil {
+		t.Fatalf("expected Create to wait out the short window and succeed, got error: %v", err)
+	}
+	if want, got := instance.Region, "us-central1-a"; got != want {
+		t.Errorf("Want instance Region %q, got %q", want, got)
+	}
+}
+
+// TestCreateReturnsInstanceOnPollRateLimitGiveUp verifies that when an
+// accepted Insert's operation poll exhausts its rate-limit retries, Create
+// neither re-inserts the name (the error wraps a rate limit, which is
+// otherwise retried) nor drops the VM: it returns the instance's identity
+// with the error, so the reaper can destroy it.
+func TestCreateReturnsInstanceOnPollRateLimitGiveUp(t *testing.T) {
+	defer gock.Off()
+
+	mockAcceptedInsert()
+
+	// A second Insert for the same name must never be made.
+	reinsert := gock.New("https://compute.googleapis.com").
+		Post("/compute/v1/projects/my-project/zones/us-central1-a/instances").
+		Reply(409).
+		JSON(map[string]interface{}{
+			"error": map[string]interface{}{
+				"code":    409,
+				"message": "The resource already exists",
+				"errors":  []map[string]interface{}{{"reason": "alreadyExists"}},
+			},
+		})
+
+	// The initial poll plus one retry, then give up - exactly this many.
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/operations/operation-name").
+		Times(2).
+		Reply(429).
+		AddHeader("Retry-After", "0").
+		JSON(map[string]interface{}{
+			"error": map[string]interface{}{"code": 429, "message": "Too Many Requests"},
+		})
+
+	p := newCreateTestProvider(t)
+	p.rateLimit.maxOperationRetries = 1
+
+	instance, err := p.Create(context.Background(), autoscaler.InstanceCreateOpts{Name: "agent-807jVFwj"})
+
+	var unconfirmed *insertUnconfirmedError
+	if !errors.As(err, &unconfirmed) {
+		t.Fatalf("expected an *insertUnconfirmedError, got %v", err)
+	}
+	var rl *retryAfterError
+	if !errors.As(err, &rl) {
+		t.Errorf("expected the error to still wrap the rate limit, got %v", err)
+	}
+	if instance == nil || instance.ID != "agent-807jvfwj" {
+		t.Fatalf("expected the accepted instance to be returned, got %+v", instance)
+	}
+	if reinsert.Done() {
+		t.Errorf("expected the accepted name never to be inserted a second time")
 	}
 }
