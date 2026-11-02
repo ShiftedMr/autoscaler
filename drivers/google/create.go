@@ -9,7 +9,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/rand"
 	"strings"
 	"time"
 
@@ -20,6 +19,20 @@ import (
 	"google.golang.org/api/compute/v1"
 	"google.golang.org/api/googleapi"
 )
+
+// abandonSearchError signals a failure that applies to every remaining
+// candidate, not just this zone or machine type, so Create stops entirely
+// rather than trying the next one. Used for a name conflict: every candidate
+// in a call shares the same instance name, so all are equally blocked.
+type abandonSearchError struct {
+	Err error
+}
+
+// Error implements the error interface.
+func (e *abandonSearchError) Error() string { return e.Err.Error() }
+
+// Unwrap lets errors.Is/errors.As see through to the underlying error.
+func (e *abandonSearchError) Unwrap() error { return e.Err }
 
 // insertUnconfirmedError signals that Google may have accepted an Insert (so
 // the name may be reserved and the VM may exist) but its outcome couldn't be
@@ -152,50 +165,136 @@ type createSearch struct {
 	rateLimitHitsWithoutWaiting int
 }
 
-// Create provisions an instance in a randomly chosen zone. createTimeout
-// bounds the whole call, including any waiting for a rate-limit turn.
+// Create provisions an instance, trying every configured machine type
+// across every configured zone before giving up. createSearchTimeout
+// bounds the total search time, since an async stockout is only detected
+// by polling, and that cost multiplies across every (zone, size) tried.
 //
-// A rate-limit response is treated as project/region-wide: every concurrent
-// Create call waits its turn via waitForRateLimitTurn instead of retrying
+// A rate-limit response is treated as project/region-wide, not specific to
+// one (zone, size): every candidate across every concurrent Create call
+// waits its turn via waitForRateLimitTurn instead of retrying
 // independently, so only one attempt is ever in flight against an
 // already-exhausted quota.
 func (p *provider) Create(ctx context.Context, opts autoscaler.InstanceCreateOpts) (*autoscaler.Instance, error) {
-	ctx, cancel := context.WithTimeout(ctx, p.createTimeout)
+	ctx, cancel := context.WithTimeout(ctx, p.createSearchTimeout)
 	defer cancel()
 
 	s := &createSearch{p: p, opts: opts}
 
-	// select random zone from the list
-	zone := p.zones[rand.Intn(len(p.zones))]
-	return s.tryZone(ctx, zone, p.size, p.diskType)
+	err := errors.New("no machine types or zones configured")
+	sizes := p.sizes()
+	diskTypes := p.diskTypes()
+
+	var instance *autoscaler.Instance
+	for i, size := range sizes {
+		instance, err = s.tryAllZones(ctx, size, diskTypes[i])
+		if instance != nil {
+			return instance, err
+		}
+		var abandon *abandonSearchError
+		if errors.As(err, &abandon) {
+			// Stop trying other machine types too; err already explains
+			// why (see abandonSearchError).
+			return nil, err
+		}
+		// No special case needed for a rate-limit give-up: the next size's
+		// first attempt hits the same check, and rateLimitHitsWithoutWaiting
+		// is shared across sizes, so it gives up the same way.
+	}
+
+	return nil, fmt.Errorf("failed to create instance, no available machine types or zones: %w", err)
+}
+
+// tryAllZones attempts size (using diskType for its boot disk) in every
+// configured zone (random order), continuing past each error - see tryZone
+// for what happens on any one zone, and noteZoneOutcome for what a zone's
+// final outcome means for the rest of this search.
+func (s *createSearch) tryAllZones(ctx context.Context, size, diskType string) (*autoscaler.Instance, error) {
+	var instance *autoscaler.Instance
+	var stop bool
+	// Must stay non-nil: if p.zones is ever empty the loop below never
+	// runs, and this is what gets wrapped into the error Create
+	// ultimately returns. See TestCreateWithNoZonesConfigured.
+	err := fmt.Errorf("no zones configured for machine type %q", size)
+	var attempted, skipped int
+	for _, zone := range s.p.shuffledZones() {
+		if remaining, cooling := s.p.familyCooldowns.remaining(familyKey(zone, size)); cooling {
+			// Never touch err here: it may already hold a more
+			// informative error from an earlier zone (shuffle order makes
+			// this nondeterministic), and this candidate isn't attempted
+			// at all.
+			skipped++
+			logger.FromContext(ctx).
+				WithField("zone", zone).
+				WithField("size", size).
+				WithField("remaining", remaining).
+				Infoln("skipping zone whose machine family recently hit a CPU quota in this region")
+			continue
+		}
+		if remaining, cooling := s.p.stockouts.remaining(zoneSize{zone, size}); cooling {
+			// Same reasoning as the family-quota skip above.
+			skipped++
+			logger.FromContext(ctx).
+				WithField("zone", zone).
+				WithField("size", size).
+				WithField("remaining", remaining).
+				Infoln("skipping zone that recently stocked out for this machine type")
+			continue
+		}
+		attempted++
+		instance, err, stop = s.tryZone(ctx, zone, size, diskType)
+		if instance != nil {
+			return instance, err
+		}
+		if stop {
+			return nil, err
+		}
+		s.noteZoneOutcome(ctx, zone, size, diskType, err)
+	}
+	if attempted == 0 && skipped > 0 {
+		return nil, fmt.Errorf("every zone for machine type %q is cooling down from a recent stockout or quota exhaustion", size)
+	}
+	return nil, err
 }
 
 // tryZone attempts size (using diskType for its boot disk) in zone, waiting
 // out any rate limit first and retrying after one (see waitTurnIfLimited,
-// noteRateLimitHit).
-func (s *createSearch) tryZone(ctx context.Context, zone, size, diskType string) (*autoscaler.Instance, error) {
+// noteRateLimitHit). stopZones reports whether tryAllZones should give up on
+// this size entirely; Create's *abandonSearchError check further
+// distinguishes abandoning everything from trying the next machine type.
+func (s *createSearch) tryZone(ctx context.Context, zone, size, diskType string) (instance *autoscaler.Instance, err error, stopZones bool) {
 	for {
 		waited, err := s.waitTurnIfLimited(ctx, zone, size)
 		if err != nil {
-			return nil, err
+			return nil, err, true
 		}
 
-		instance, err := s.p.attemptInZone(ctx, s.opts, zone, size, diskType, waited)
+		instance, err = s.p.attemptInZone(ctx, s.opts, zone, size, diskType, waited)
 		// Any instance, even with an error, means Google accepted the
-		// insert (see insertUnconfirmedError): never retry it, even though
-		// the error may wrap a rate limit.
+		// insert (see insertUnconfirmedError): stop the search, and never
+		// retry it, even though the error may wrap a rate limit.
 		if instance != nil {
-			return instance, err
+			return instance, err, false
 		}
 
 		var rl *retryAfterError
 		if errors.As(err, &rl) {
 			if giveUpErr := s.noteRateLimitHit(ctx, zone, size, rl, waited); giveUpErr != nil {
-				return nil, giveUpErr
+				return nil, giveUpErr, true
 			}
 			continue
 		}
-		return nil, err
+
+		if isNameConflictError(err) {
+			logger.FromContext(ctx).
+				WithField("zone", zone).
+				WithField("size", size).
+				WithField("name", s.opts.Name).
+				WithError(err).
+				Errorln("instance name already in use, abandoning the rest of this search")
+			return nil, &abandonSearchError{Err: err}, true
+		}
+		return nil, err, false
 	}
 }
 
@@ -244,8 +343,57 @@ func (s *createSearch) noteRateLimitHit(ctx context.Context, zone, size string, 
 	return fmt.Errorf("rate limited: hit the limit %d times in a row without waiting - giving up: %w", s.rateLimitHitsWithoutWaiting, rl)
 }
 
+// noteZoneOutcome logs and records a zone's final outcome, and is the sole
+// place that decides what level that outcome warrants - createInZone
+// deliberately never logs an insert failure itself, so each outcome is logged
+// exactly once here, with the full picture of what this candidate's error
+// actually is.
+func (s *createSearch) noteZoneOutcome(ctx context.Context, zone, size, diskType string, err error) {
+	switch {
+	case isFamilyQuotaError(err):
+		s.p.familyCooldowns.record(familyKey(zone, size), s.p.familyQuotaCooldown)
+		logger.FromContext(ctx).
+			WithField("zone", zone).
+			WithField("size", size).
+			WithField("cooldown", s.p.familyQuotaCooldown).
+			WithError(err).
+			Infoln("machine family vCPU quota exhausted in this region, marking the family unavailable region-wide for the cooldown period")
+	case isStockoutError(err):
+		s.p.stockouts.record(zoneSize{zone, size}, s.p.stockoutCooldown)
+		logger.FromContext(ctx).
+			WithField("zone", zone).
+			WithField("size", size).
+			WithField("cooldown", s.p.stockoutCooldown).
+			WithError(err).
+			Infoln("machine type unavailable in zone, trying next zone")
+	case ctx.Err() != nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)):
+		// The search itself is out of time, so each remaining candidate
+		// fails instantly with the same context error; logging every one
+		// is noise.
+	default:
+		// Unrecognized - most likely a permanent misconfiguration (bad
+		// image permission, invalid machine type, etc.) rather than
+		// something expected to clear on retry, so it needs to reach
+		// Error-level alerting even if a later candidate happens to
+		// succeed and Create as a whole doesn't fail.
+		var opErr *operationError
+		entry := logger.FromContext(ctx).
+			WithField("zone", zone).
+			WithField("size", size).
+			WithField("image", s.p.image).
+			WithField("diskType", diskType).
+			WithField("name", s.opts.Name).
+			WithError(err)
+		if errors.As(err, &opErr) && opErr.Code != "" {
+			entry = entry.WithField("code", opErr.Code)
+		}
+		entry.Errorln("instance insert failed")
+	}
+}
+
 // createInZone provisions a single instance of size (with a boot disk of
-// diskType) in zone. See Create for the surrounding search.
+// diskType) in zone, without any zone or machine-type fallback of its own;
+// see Create for that.
 func (p *provider) createInZone(ctx context.Context, opts autoscaler.InstanceCreateOpts, zone, size, diskType string) (*autoscaler.Instance, error) {
 	p.init.Do(func() {
 		p.setup(ctx)
@@ -366,18 +514,8 @@ func (p *provider) createInZone(ctx context.Context, opts autoscaler.InstanceCre
 			if errors.Is(err, context.DeadlineExceeded) {
 				logger.WithError(err).
 					Warnln("slow response from provider: the instance insert request did not complete in time, leaving the instance for the reaper")
-			} else {
-				logger.WithError(err).
-					Errorln("instance insert failed")
 			}
 			return p.unconfirmedInsert(opts, name, zone, size, err)
-		}
-		// A rate limit is retried by the caller, which logs it once there
-		// instead of at Error on every attempt.
-		var rl *retryAfterError
-		if !errors.As(err, &rl) {
-			logger.WithError(err).
-				Errorln("instance insert failed")
 		}
 		return nil, err
 	}
@@ -391,9 +529,6 @@ func (p *provider) createInZone(ctx context.Context, opts autoscaler.InstanceCre
 		if errors.Is(err, context.DeadlineExceeded) {
 			logger.WithError(err).
 				Warnln("slow response from provider: the instance insert did not finish in time, leaving the instance for the reaper")
-		} else {
-			logger.WithError(err).
-				Errorln("instance insert operation failed")
 		}
 		return p.unconfirmedInsert(opts, name, zone, size, err)
 	}

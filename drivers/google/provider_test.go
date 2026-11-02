@@ -48,6 +48,18 @@ func TestDefaults(t *testing.T) {
 	if got, want := p.size, "n1-standard-1"; got != want {
 		t.Errorf("Want size %q, got %q", want, got)
 	}
+	if p.sizesAlt != nil {
+		t.Errorf("Want no fallback machine types by default, got %q", p.sizesAlt)
+	}
+	if got, want := p.sizes(), []string{"n1-standard-1"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Want sizes %q with no alt configured, got %q", want, got)
+	}
+	if p.diskTypesAlt != nil {
+		t.Errorf("Want no fallback disk types by default, got %q", p.diskTypesAlt)
+	}
+	if got, want := p.diskTypes(), []string{"pd-standard"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Want diskTypes %q with no alt configured, got %q", want, got)
+	}
 	if !reflect.DeepEqual(p.tags, defaultTags) {
 		t.Errorf("Want default tags")
 	}
@@ -898,4 +910,97 @@ func TestWaitForRateLimitTurnSerializesMultipleWaiters(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestDiskTypesDefaultsToPrimaryForEveryFallbackSize(t *testing.T) {
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithDiskType("pd-ssd"),
+		WithMachineType("n1-standard-4"),
+		WithMachineTypeAlt([]string{"n1-standard-2", "n1-standard-1"}),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+
+	got := p.diskTypes()
+	want := []string{"pd-ssd", "pd-ssd", "pd-ssd"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Want diskTypes %q when DiskTypeAlt is unset, got %q", want, got)
+	}
+}
+
+func TestDiskTypesPairedWithMachineTypeAlt(t *testing.T) {
+	v, err := New(
+		WithClient(http.DefaultClient),
+		WithDiskType("pd-ssd"),
+		WithMachineType("n1-standard-4"),
+		WithMachineTypeAlt([]string{"n1-standard-2", "n1-standard-1"}),
+		WithDiskTypeAlt([]string{"pd-balanced", "pd-standard"}),
+	)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	p := v.(*provider)
+
+	got := p.diskTypes()
+	want := []string{"pd-ssd", "pd-balanced", "pd-standard"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Want diskTypes %q paired with sizes, got %q", want, got)
+	}
+}
+
+func TestNewRejectsMismatchedDiskTypeAltLength(t *testing.T) {
+	_, err := New(
+		WithClient(http.DefaultClient),
+		WithMachineType("n1-standard-4"),
+		WithMachineTypeAlt([]string{"n1-standard-2", "n1-standard-1"}),
+		WithDiskTypeAlt([]string{"pd-balanced"}),
+	)
+	if err == nil {
+		t.Fatalf("expected an error when DiskTypeAlt length doesn't match MachineTypeAlt")
+	}
+}
+
+func TestNewDerivesCreateSearchTimeout(t *testing.T) {
+	// 7 sizes x 3 zones = 21 candidates: the 3m attempt timeout plus 10s for
+	// each of the 20 before the last.
+	v, err := New(
+		WithMachineType("n4-standard-8"),
+		WithMachineTypeAlt([]string{"a", "b", "c", "d", "e", "f"}),
+		WithZones("us-central1-a", "us-central1-b", "us-central1-c"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := v.(*provider)
+	if got, want := p.createTimeout, 3*time.Minute; got != want {
+		t.Errorf("Want default createTimeout %s, got %s", want, got)
+	}
+	if got, want := p.createSearchTimeout, 3*time.Minute+200*time.Second; got != want {
+		t.Errorf("Want derived createSearchTimeout %s, got %s", want, got)
+	}
+
+	// The derived value follows createTimeout.
+	v, err = New(WithCreateTimeout(10*time.Minute), WithZones("us-central1-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := v.(*provider).createSearchTimeout, 10*time.Minute; got != want {
+		t.Errorf("Want createSearchTimeout %s from a 10m createTimeout, got %s", want, got)
+	}
+
+	// Zero and negative values fall back to the default.
+	for _, d := range []time.Duration{0, -time.Second} {
+		v, err = New(WithCreateTimeout(d), WithZones("us-central1-a"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := v.(*provider).createTimeout, 3*time.Minute; got != want {
+			t.Errorf("Want createTimeout %s for %s, got %s", want, d, got)
+		}
+	}
 }

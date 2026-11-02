@@ -7,6 +7,7 @@ package google
 import (
 	"io/ioutil"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/drone/autoscaler/drivers/internal/userdata"
@@ -17,6 +18,21 @@ import (
 
 // Option configures a Digital Ocean provider option.
 type Option func(*provider)
+
+// trimAll trims leading/trailing whitespace from each entry. envconfig
+// splits comma-separated env vars on "," without trimming, so
+// "n1-standard-2, n1-standard-4" would otherwise produce a second entry
+// with a leading space that GCE would reject as an invalid resource name.
+func trimAll(vals []string) []string {
+	if len(vals) == 0 {
+		return vals
+	}
+	out := make([]string, len(vals))
+	for i, v := range vals {
+		out[i] = strings.TrimSpace(v)
+	}
+	return out
+}
 
 // WithClient returns an option to set the default http
 // Client used with the Google Compute provider.
@@ -45,6 +61,15 @@ func WithDiskType(diskType string) Option {
 	}
 }
 
+// WithDiskTypeAlt returns an option to set the disk type to use with each
+// corresponding fallback machine type, aligned index-for-index with
+// WithMachineTypeAlt. New returns an error if the lengths don't match.
+func WithDiskTypeAlt(diskTypes []string) Option {
+	return func(p *provider) {
+		p.diskTypesAlt = trimAll(diskTypes)
+	}
+}
+
 // WithLabels returns an option to set the metadata labels.
 func WithLabels(labels map[string]string) Option {
 	return func(p *provider) {
@@ -63,6 +88,13 @@ func WithMachineImage(image string) Option {
 func WithMachineType(size string) Option {
 	return func(p *provider) {
 		p.size = size
+	}
+}
+
+// WithMachineTypeAlt returns an option to set fallback instance types.
+func WithMachineTypeAlt(sizes []string) Option {
+	return func(p *provider) {
+		p.sizesAlt = trimAll(sizes)
 	}
 }
 

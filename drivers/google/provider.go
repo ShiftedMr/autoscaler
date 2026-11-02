@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"sync"
 	"text/template"
@@ -42,6 +43,7 @@ type provider struct {
 
 	diskSize            int64
 	diskType            string
+	diskTypesAlt        []string
 	image               string
 	labels              map[string]string
 	network             string
@@ -52,6 +54,7 @@ type provider struct {
 	scopes              []string
 	serviceAccountEmail string
 	size                string
+	sizesAlt            []string
 	tags                []string
 	zones               []string
 	userdata            *template.Template
@@ -59,9 +62,19 @@ type provider struct {
 
 	rateLimiter *rate.Limiter
 
-	// createTimeout bounds one Create attempt: the insert, its operation poll
-	// and the follow-up get.
+	// createTimeout bounds one (zone, size) attempt: the insert, its operation
+	// poll and the follow-up get. Set to the longest an attempt is expected
+	// to take on a normal day.
 	createTimeout time.Duration
+
+	// createSearchTimeout bounds how long Create spends cycling through
+	// zone/machine-type combinations, derived from createTimeout in New.
+	createSearchTimeout time.Duration
+
+	// shuffleZones returns the order Create should try p.zones in; defaults
+	// to shuffleZonesRandomly in New. Tests can set this directly for
+	// deterministic zone ordering instead of relying on randomness.
+	shuffleZones func(zones []string) []string
 
 	// destroyTimeout bounds Destroy: asking Google to delete and waiting for
 	// the delete operation to finish.
@@ -77,8 +90,29 @@ type provider struct {
 	// against this provider. See ratelimit.go for more information.
 	rateLimit rateLimitState
 
+	// familyCooldowns tracks which (region, machine family) pairs are
+	// currently cooling down from CPUS_PER_VM_FAMILY quota exhaustion, and
+	// until when; keyed via familyKey in cooldown.go.
+	familyCooldowns cooldowns[regionFamily]
+	// familyQuotaCooldown is how long a (region, family) is skipped after
+	// hitting CPUS_PER_VM_FAMILY quota exhaustion there.
+	familyQuotaCooldown time.Duration
+
+	// stockouts tracks which (zone, size) pairs are currently cooling down
+	// after stocking out, and until when; keyed via zoneSize in
+	// cooldown.go.
+	stockouts cooldowns[zoneSize]
+	// stockoutCooldown is how long a (zone, size) is skipped after
+	// stocking out.
+	stockoutCooldown time.Duration
+
 	service *compute.Service
 }
+
+// searchAllowancePerCandidate is the default createSearchTimeout's allowance
+// per (zone, size): the typical cost of a rejected insert (stockout, quota),
+// which is observed to be on the order of ten seconds.
+const searchAllowancePerCandidate = 10 * time.Second
 
 // New returns a new Google Cloud Platform provider.
 func New(opts ...Option) (autoscaler.Provider, error) {
@@ -92,6 +126,9 @@ func New(opts ...Option) (autoscaler.Provider, error) {
 	if p.diskType == "" {
 		p.diskType = "pd-standard"
 	}
+	if len(p.diskTypesAlt) > 0 && len(p.diskTypesAlt) != len(p.sizesAlt) {
+		return nil, fmt.Errorf("google: DRONE_GOOGLE_DISK_TYPE_ALT must have %d entries to match DRONE_GOOGLE_MACHINE_TYPE_ALT, got %d", len(p.sizesAlt), len(p.diskTypesAlt))
+	}
 	if len(p.zones) == 0 {
 		p.zones = []string{"us-central1-a"}
 	}
@@ -101,11 +138,21 @@ func New(opts ...Option) (autoscaler.Provider, error) {
 	if p.createTimeout <= 0 {
 		p.createTimeout = 3 * time.Minute
 	}
+	// Room for one slow attempt plus the typical cost of every candidate
+	// before the last, so a slow final candidate isn't cut off by the
+	// rejections ahead of it.
+	p.createSearchTimeout = p.createTimeout + searchAllowancePerCandidate*time.Duration(len(p.sizes())*len(p.zones)-1)
 	if p.destroyTimeout == 0 {
 		p.destroyTimeout = 15 * time.Minute
 	}
 	if p.maxTransientDelay == 0 {
 		p.maxTransientDelay = 5 * time.Second
+	}
+	if p.familyQuotaCooldown == 0 {
+		p.familyQuotaCooldown = 5 * time.Minute
+	}
+	if p.stockoutCooldown == 0 {
+		p.stockoutCooldown = 30 * time.Second
 	}
 	if p.image == "" {
 		p.image = "ubuntu-os-cloud/global/images/ubuntu-2004-focal-v20220712"
@@ -132,6 +179,9 @@ func New(opts ...Option) (autoscaler.Provider, error) {
 		p.serviceAccountEmail = "default"
 	}
 
+	if p.shuffleZones == nil {
+		p.shuffleZones = shuffleZonesRandomly
+	}
 	p.rateLimit.init()
 
 	if p.rateLimiter == nil {
@@ -151,6 +201,43 @@ func New(opts ...Option) (autoscaler.Provider, error) {
 		}
 	}
 	return p, nil
+}
+
+func (p *provider) sizes() []string {
+	return append([]string{p.size}, p.sizesAlt...)
+}
+
+// diskTypes returns the disk type to use for each entry in sizes(), aligned
+// index-for-index: diskTypes()[i] is the disk type for sizes()[i]. If
+// diskTypesAlt wasn't configured, every machine type (primary and fallback)
+// uses the primary disk type.
+func (p *provider) diskTypes() []string {
+	if len(p.diskTypesAlt) == 0 {
+		out := make([]string, len(p.sizesAlt)+1)
+		for i := range out {
+			out[i] = p.diskType
+		}
+		return out
+	}
+	return append([]string{p.diskType}, p.diskTypesAlt...)
+}
+
+// shuffledZones returns p.zones in the order Create should try them next,
+// per p.shuffleZones.
+func (p *provider) shuffledZones() []string {
+	return p.shuffleZones(p.zones)
+}
+
+// shuffleZonesRandomly is the default p.shuffleZones: it returns zones in
+// random order, so repeated Create calls don't all hammer the same zone
+// first.
+func shuffleZonesRandomly(zones []string) []string {
+	out := make([]string, len(zones))
+	copy(out, zones)
+	rand.Shuffle(len(out), func(i, j int) {
+		out[i], out[j] = out[j], out[i]
+	})
+	return out
 }
 
 // operationError preserves Google's structured Code/Message operation-error
