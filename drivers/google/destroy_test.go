@@ -300,3 +300,96 @@ func TestDestroyTimeoutAppliesToTheDeleteRequestItself(t *testing.T) {
 		t.Errorf("expected Destroy to give up near destroyTimeout (50ms), took %s", elapsed)
 	}
 }
+
+// TestDestroyRateLimitedPollGivesUpAfterMaxRetries verifies that a delete
+// whose operation poll is rate limited past maxOperationRetries returns an
+// error wrapping the rate limit, leaving the server for the reaper to
+// retry.
+func TestDestroyRateLimitedPollGivesUpAfterMaxRetries(t *testing.T) {
+	defer gock.Off()
+
+	gock.New("https://compute.googleapis.com").
+		Delete("/compute/v1/projects/my-project/zones/us-central1-a/instances/my-instance").
+		Reply(200).
+		BodyString(`{ "name": "operation-name" }`)
+
+	// The initial poll plus one retry, then give up - exactly this many.
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/operations/operation-name").
+		Times(2).
+		Reply(429).
+		AddHeader("Retry-After", "0").
+		JSON(map[string]interface{}{
+			"error": map[string]interface{}{"code": 429, "message": "Too Many Requests"},
+		})
+
+	p := newDestroyTestProvider(t)
+	p.rateLimit.maxOperationRetries = 1
+
+	err := p.Destroy(context.Background(), destroyTestInstance)
+	var rl *retryAfterError
+	if !errors.As(err, &rl) {
+		t.Fatalf("expected the give-up error to wrap the rate limit, got %v", err)
+	}
+	if !gock.IsDone() {
+		t.Errorf("expected exactly the initial poll plus one retry")
+	}
+}
+
+// TestDestroyPublishesRateLimitIntoSharedWindow pins that a rate limit
+// Destroy hits while polling is recorded for every other caller to see -
+// intentional, since the quota is shared across Create and Destroy.
+func TestDestroyPublishesRateLimitIntoSharedWindow(t *testing.T) {
+	defer gock.Off()
+
+	gock.New("https://compute.googleapis.com").
+		Delete("/compute/v1/projects/my-project/zones/us-central1-a/instances/my-instance").
+		Reply(200).
+		BodyString(`{ "name": "operation-name" }`)
+
+	gock.New("https://compute.googleapis.com").
+		Get("/compute/v1/projects/my-project/zones/us-central1-a/operations/operation-name").
+		Reply(429).
+		AddHeader("Retry-After", "30").
+		JSON(map[string]interface{}{
+			"error": map[string]interface{}{"code": 429, "message": "Too Many Requests"},
+		})
+
+	p := newDestroyTestProvider(t)
+	// Short enough that waiting out the 30s Retry-After can't fit, so
+	// Destroy gives up immediately instead of sleeping - after recording.
+	p.destroyTimeout = 100 * time.Millisecond
+
+	if err := p.Destroy(context.Background(), destroyTestInstance); err == nil {
+		t.Fatalf("expected Destroy to give up rather than wait out the Retry-After")
+	}
+	if remaining, limited := p.rateLimitBackoff(); !limited || remaining < 20*time.Second {
+		t.Errorf("expected Destroy to publish the ~30s rate limit into the shared window, got limited=%v remaining=%s", limited, remaining)
+	}
+}
+
+// TestDestroyPublishesRateLimitFromDeleteRequestIntoSharedWindow verifies a
+// 429 on the delete request itself, not just the operation poll, is
+// recorded into the shared window, so a concurrent Create call can see it
+// too.
+func TestDestroyPublishesRateLimitFromDeleteRequestIntoSharedWindow(t *testing.T) {
+	defer gock.Off()
+
+	gock.New("https://compute.googleapis.com").
+		Delete("/compute/v1/projects/my-project/zones/us-central1-a/instances/my-instance").
+		Reply(429).
+		AddHeader("Retry-After", "30").
+		JSON(map[string]interface{}{
+			"error": map[string]interface{}{"code": 429, "message": "Too Many Requests"},
+		})
+
+	p := newDestroyTestProvider(t)
+
+	var rl *retryAfterError
+	if err := p.Destroy(context.Background(), destroyTestInstance); !errors.As(err, &rl) {
+		t.Fatalf("expected Destroy to return an error wrapping the rate limit, got %v", err)
+	}
+	if remaining, limited := p.rateLimitBackoff(); !limited || remaining < 20*time.Second {
+		t.Errorf("expected Destroy to publish the ~30s rate limit from the delete request into the shared window, got limited=%v remaining=%s", limited, remaining)
+	}
+}

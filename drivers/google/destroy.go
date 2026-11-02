@@ -45,6 +45,13 @@ func (p *provider) Destroy(ctx context.Context, instance *autoscaler.Instance) e
 		return nil
 	})
 	if err != nil {
+		// Published into the shared window so a concurrent Create call can
+		// see this rate limit too - mirrors attemptInZone (create.go), which
+		// does the same for a rate limit on Insert.
+		var rl *retryAfterError
+		if errors.As(err, &rl) {
+			p.recordRateLimit(rl.retryAfter)
+		}
 		return err
 	}
 
