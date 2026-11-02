@@ -1,6 +1,8 @@
 package google
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -276,6 +278,415 @@ func TestParseRetryAfter(t *testing.T) {
 			got := parseRetryAfter(test.input)
 			if got != test.want {
 				t.Errorf("parseRetryAfter(%q) = %v, want %v", test.input, got, test.want)
+			}
+		})
+	}
+}
+
+func TestIsStockoutError(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		stockout bool
+	}{
+		{
+			name:     "nil error",
+			err:      nil,
+			stockout: false,
+		},
+		{
+			name: "operation error with ZONE_RESOURCE_POOL_EXHAUSTED code",
+			err: &operationError{
+				Code:    "ZONE_RESOURCE_POOL_EXHAUSTED",
+				Message: "The zone does not have enough resources available",
+			},
+			stockout: true,
+		},
+		{
+			name: "operation error with STOCKOUT in message",
+			err: &operationError{
+				Code: "",
+				Message: "The zone 'projects/my-project/zones/us-central1-c' does not have enough resources " +
+					"available to fulfill the request.  'NULL:0/NULL:0/NULL:0 (state:STOCKOUT, sub-state:STOCKOUT, " +
+					"resource type:compute)'",
+			},
+			stockout: true,
+		},
+		{
+			name: "operation error unrelated",
+			err: &operationError{
+				Code:    "RESOURCE_NOT_FOUND",
+				Message: "The resource was not found",
+			},
+			stockout: false,
+		},
+		{
+			name: "googleapi error with ZONE_RESOURCE_POOL_EXHAUSTED reason",
+			err: &googleapi.Error{
+				Code: http.StatusBadRequest,
+				Errors: []googleapi.ErrorItem{
+					{Reason: "ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS"},
+				},
+			},
+			stockout: true,
+		},
+		{
+			name: "googleapi error with STOCKOUT in message",
+			err: &googleapi.Error{
+				Code:    http.StatusBadRequest,
+				Message: "state:STOCKOUT, sub-state:STOCKOUT",
+			},
+			stockout: true,
+		},
+		{
+			name: "googleapi error unrelated",
+			err: &googleapi.Error{
+				Code:    http.StatusForbidden,
+				Message: "insufficient permissions",
+			},
+			stockout: false,
+		},
+		{
+			// Google's shared error model also uses a bare "STOCKOUT" reason
+			// (e.g. on Spanner); check for it on Compute too in case a future
+			// response uses it instead of ZONE_RESOURCE_POOL_EXHAUSTED.
+			name: "googleapi error with STOCKOUT reason",
+			err: &googleapi.Error{
+				Code: http.StatusBadRequest,
+				Errors: []googleapi.ErrorItem{
+					{Reason: "STOCKOUT"},
+				},
+			},
+			stockout: true,
+		},
+		{
+			name: "googleapi error with STOCKOUT in a per-item message",
+			err: &googleapi.Error{
+				Code: http.StatusBadRequest,
+				Errors: []googleapi.ErrorItem{
+					{Message: "state:STOCKOUT, sub-state:STOCKOUT"},
+				},
+			},
+			stockout: true,
+		},
+		{
+			name: "operation error with RESOURCE_POOL_EXHAUSTED in message rather than code",
+			err: &operationError{
+				Code:    "",
+				Message: "ZONE_RESOURCE_POOL_EXHAUSTED: no capacity",
+			},
+			stockout: true,
+		},
+		{
+			// QUOTA_EXCEEDED is a project-level limit, not a (zone, size)
+			// capacity issue, and is deliberately not treated as a stockout.
+			name: "googleapi error with QUOTA_EXCEEDED reason is not a stockout",
+			err: &googleapi.Error{
+				Code: http.StatusForbidden,
+				Errors: []googleapi.ErrorItem{
+					{Reason: "QUOTA_EXCEEDED"},
+				},
+			},
+			stockout: false,
+		},
+		{
+			name: "operation error with QUOTA_EXCEEDED code is not a stockout",
+			err: &operationError{
+				Code:    "QUOTA_EXCEEDED",
+				Message: "Quota 'CPUS' exceeded",
+			},
+			stockout: false,
+		},
+		{
+			name:     "unrelated error type",
+			err:      errors.New("boom"),
+			stockout: false,
+		},
+		{
+			// errors.As (rather than a direct type assertion) means this still
+			// works if something wraps the underlying error with %w later.
+			name: "wrapped operation error with stockout code",
+			err: fmt.Errorf("instance insert operation failed: %w", &operationError{
+				Code: "ZONE_RESOURCE_POOL_EXHAUSTED",
+			}),
+			stockout: true,
+		},
+		{
+			name: "wrapped googleapi error with stockout reason",
+			err: fmt.Errorf("instance insert failed: %w", &googleapi.Error{
+				Code: http.StatusBadRequest,
+				Errors: []googleapi.ErrorItem{
+					{Reason: "ZONE_RESOURCE_POOL_EXHAUSTED"},
+				},
+			}),
+			stockout: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := isStockoutError(test.err)
+			if result != test.stockout {
+				t.Errorf("isStockoutError(%v) = %v, want %v", test.err, result, test.stockout)
+			}
+		})
+	}
+}
+
+func TestIsFamilyQuotaError(t *testing.T) {
+	tests := []struct {
+		name    string
+		err     error
+		isQuota bool
+	}{
+		{
+			name:    "nil error",
+			err:     nil,
+			isQuota: false,
+		},
+		{
+			name: "operation error with CPUS_PER_VM_FAMILY in message",
+			err: &operationError{
+				Code:    "QUOTA_EXCEEDED",
+				Message: "Quota 'CPUS_PER_VM_FAMILY' exceeded. Limit: 1500.0 in region us-central1.",
+			},
+			isQuota: true,
+		},
+		{
+			// The negative case this detector must not broaden into: a
+			// bare QUOTA_EXCEEDED with no CPUS_PER_VM_FAMILY signal (e.g.
+			// the project-wide CPUS quota) must keep flowing down the
+			// generic error path. See TestCreateLogsOperationErrorCode,
+			// which depends on this exact shape not being detected here.
+			name: "operation error with QUOTA_EXCEEDED but not CPUS_PER_VM_FAMILY",
+			err: &operationError{
+				Code:    "QUOTA_EXCEEDED",
+				Message: "Quota 'CPUS' exceeded. Limit: 24.0 in region us-central1.",
+			},
+			isQuota: false,
+		},
+		{
+			name: "operation error unrelated",
+			err: &operationError{
+				Code:    "RESOURCE_NOT_FOUND",
+				Message: "The resource was not found",
+			},
+			isQuota: false,
+		},
+		{
+			name: "googleapi error with CPUS_PER_VM_FAMILY in message",
+			err: &googleapi.Error{
+				Code:    http.StatusForbidden,
+				Message: "Quota 'CPUS_PER_VM_FAMILY' exceeded. Limit: 1500.0 in region us-central1.",
+			},
+			isQuota: true,
+		},
+		{
+			name: "googleapi error with CPUS_PER_VM_FAMILY in a per-item message",
+			err: &googleapi.Error{
+				Code: http.StatusForbidden,
+				Errors: []googleapi.ErrorItem{
+					{Message: "Quota 'CPUS_PER_VM_FAMILY' exceeded"},
+				},
+			},
+			isQuota: true,
+		},
+		{
+			name: "googleapi error unrelated",
+			err: &googleapi.Error{
+				Code:    http.StatusForbidden,
+				Message: "insufficient permissions",
+			},
+			isQuota: false,
+		},
+		{
+			name:    "unrelated error type",
+			err:     errors.New("boom"),
+			isQuota: false,
+		},
+		{
+			name: "wrapped operation error with CPUS_PER_VM_FAMILY",
+			err: fmt.Errorf("instance insert operation failed: %w", &operationError{
+				Code:    "QUOTA_EXCEEDED",
+				Message: "Quota 'CPUS_PER_VM_FAMILY' exceeded",
+			}),
+			isQuota: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := isFamilyQuotaError(test.err)
+			if result != test.isQuota {
+				t.Errorf("isFamilyQuotaError(%v) = %v, want %v", test.err, result, test.isQuota)
+			}
+		})
+	}
+}
+
+func TestMachineFamily(t *testing.T) {
+	tests := []struct{ size, family string }{
+		{"n2-standard-8", "n2"},
+		{"n2d-highcpu-32", "n2d"},
+		{"e2-medium", "e2"},
+		{"nodash", "nodash"},
+		{"", ""},
+	}
+	for _, test := range tests {
+		t.Run(test.size, func(t *testing.T) {
+			if got := machineFamily(test.size); got != test.family {
+				t.Errorf("machineFamily(%q) = %q, want %q", test.size, got, test.family)
+			}
+		})
+	}
+}
+
+func TestZoneRegion(t *testing.T) {
+	tests := []struct{ zone, region string }{
+		{"us-central1-a", "us-central1"},
+		{"europe-west4-b", "europe-west4"},
+		{"nodash", "nodash"},
+		{"", ""},
+	}
+	for _, test := range tests {
+		t.Run(test.zone, func(t *testing.T) {
+			if got := zoneRegion(test.zone); got != test.region {
+				t.Errorf("zoneRegion(%q) = %q, want %q", test.zone, got, test.region)
+			}
+		})
+	}
+}
+
+func TestIsAlreadyExistsError(t *testing.T) {
+	tests := []struct {
+		name          string
+		err           error
+		alreadyExists bool
+	}{
+		{
+			name:          "nil error",
+			err:           nil,
+			alreadyExists: false,
+		},
+		{
+			name: "409 with alreadyExists reason",
+			err: &googleapi.Error{
+				Code: http.StatusConflict,
+				Errors: []googleapi.ErrorItem{
+					{Reason: "alreadyExists"},
+				},
+			},
+			alreadyExists: true,
+		},
+		{
+			name:          "409 with no Errors items",
+			err:           &googleapi.Error{Code: http.StatusConflict},
+			alreadyExists: false,
+		},
+		{
+			name: "409 with an unrelated reason",
+			err: &googleapi.Error{
+				Code: http.StatusConflict,
+				Errors: []googleapi.ErrorItem{
+					{Reason: "resourceInUseByAnotherResource"},
+				},
+			},
+			alreadyExists: false,
+		},
+		{
+			name: "non-409 with alreadyExists reason",
+			err: &googleapi.Error{
+				Code: http.StatusBadRequest,
+				Errors: []googleapi.ErrorItem{
+					{Reason: "alreadyExists"},
+				},
+			},
+			alreadyExists: false,
+		},
+		{
+			name:          "unrelated error type",
+			err:           errors.New("boom"),
+			alreadyExists: false,
+		},
+		{
+			// errors.As (rather than a direct type assertion) means this
+			// still works if something wraps the underlying error with %w.
+			name: "wrapped googleapi error with alreadyExists reason",
+			err: fmt.Errorf("instance insert failed: %w", &googleapi.Error{
+				Code: http.StatusConflict,
+				Errors: []googleapi.ErrorItem{
+					{Reason: "alreadyExists"},
+				},
+			}),
+			alreadyExists: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := isAlreadyExistsError(test.err)
+			if result != test.alreadyExists {
+				t.Errorf("isAlreadyExistsError(%v) = %v, want %v", test.err, result, test.alreadyExists)
+			}
+		})
+	}
+}
+
+func TestIsNameConflictError(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		conflict bool
+	}{
+		{
+			name:     "nil error",
+			err:      nil,
+			conflict: false,
+		},
+		{
+			name: "sync 409 with alreadyExists reason",
+			err: &googleapi.Error{
+				Code: http.StatusConflict,
+				Errors: []googleapi.ErrorItem{
+					{Reason: "alreadyExists"},
+				},
+			},
+			conflict: true,
+		},
+		{
+			name: "async operation error with RESOURCE_ALREADY_EXISTS code",
+			err: &operationError{
+				Code:    "RESOURCE_ALREADY_EXISTS",
+				Message: "The resource 'projects/my-project/zones/us-central1-a/instances/agent-x' already exists",
+			},
+			conflict: true,
+		},
+		{
+			name: "async operation error with an unrelated code",
+			err: &operationError{
+				Code: "QUOTA_EXCEEDED",
+			},
+			conflict: false,
+		},
+		{
+			name:     "unrelated error type",
+			err:      errors.New("boom"),
+			conflict: false,
+		},
+		{
+			name: "wrapped async operation error with RESOURCE_ALREADY_EXISTS code",
+			err: fmt.Errorf("instance insert operation failed: %w", &operationError{
+				Code: "RESOURCE_ALREADY_EXISTS",
+			}),
+			conflict: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := isNameConflictError(test.err)
+			if result != test.conflict {
+				t.Errorf("isNameConflictError(%v) = %v, want %v", test.err, result, test.conflict)
 			}
 		})
 	}

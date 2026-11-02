@@ -163,6 +163,7 @@ type (
 
 		Google struct {
 			MachineType         string            `envconfig:"DRONE_GOOGLE_MACHINE_TYPE"`
+			MachineTypeAlt      []string          `envconfig:"DRONE_GOOGLE_MACHINE_TYPE_ALT"`
 			MachineImage        string            `envconfig:"DRONE_GOOGLE_MACHINE_IMAGE"`
 			Network             string            `envconfig:"DRONE_GOOGLE_NETWORK"`
 			Subnetwork          string            `envconfig:"DRONE_GOOGLE_SUBNETWORK"`
@@ -172,6 +173,7 @@ type (
 			ServiceAccountEmail string            `envconfig:"DRONE_GOOGLE_SERVICE_ACCOUNT_EMAIL"`
 			DiskSize            int64             `envconfig:"DRONE_GOOGLE_DISK_SIZE"`
 			DiskType            string            `envconfig:"DRONE_GOOGLE_DISK_TYPE"`
+			DiskTypeAlt         []string          `envconfig:"DRONE_GOOGLE_DISK_TYPE_ALT"`
 			Project             string            `envconfig:"DRONE_GOOGLE_PROJECT"`
 			PrivateIP           bool              `split_words:"true"`
 			Tags                []string          `envconfig:"DRONE_GOOGLE_TAGS"`
